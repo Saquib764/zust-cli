@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -38,26 +39,49 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {RUN_TOKEN}"}
 
 
+def _with_retries(action):
+    delay = 1.0
+    last_error: Exception | None = None
+    for attempt in range(8):
+        try:
+            return action()
+        except (httpx.TransportError, httpx.TimeoutException) as exc:
+            last_error = exc
+            if attempt == 7:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 1.5, 8.0)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("retry loop exited unexpectedly")
+
+
 def _post_progress(client: httpx.Client, **fields) -> bool:
-    response = client.post(
-        f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/progress",
-        headers=_headers(),
-        json=fields,
-        timeout=30.0,
-    )
-    response.raise_for_status()
-    data = response.json()
-    return bool(data.get("cancel"))
+    def _send() -> bool:
+        response = client.post(
+            f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/progress",
+            headers=_headers(),
+            json=fields,
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return bool(data.get("cancel"))
+
+    return _with_retries(_send)
 
 
 def _append_log(client: httpx.Client, stream: str, line: str) -> None:
-    with _LOG_LOCK:
+    def _send() -> None:
         client.post(
             f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/logs",
             headers=_headers(),
             json={"entries": [{"stream": stream, "line": line}]},
             timeout=30.0,
         ).raise_for_status()
+
+    with _LOG_LOCK:
+        _with_retries(_send)
 
 
 def _drain(client: httpx.Client, stream: str, pipe) -> None:
@@ -124,26 +148,42 @@ def run() -> int:
         return 2
 
     checkout = resolve_workspace_root() / "repo"
-    with httpx.Client() as client:
-        stop_heartbeat = threading.Event()
+    try:
+        with httpx.Client() as client:
+            stop_heartbeat = threading.Event()
 
-        def _heartbeat() -> None:
-            while not stop_heartbeat.wait(30):
-                try:
-                    client.post(
-                        f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/progress",
-                        headers=_headers(),
-                        json={},
-                        timeout=30.0,
-                    )
-                except Exception:
-                    continue
+            def _heartbeat() -> None:
+                while not stop_heartbeat.wait(30):
+                    try:
+                        _with_retries(
+                            lambda: client.post(
+                                f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/progress",
+                                headers=_headers(),
+                                json={},
+                                timeout=30.0,
+                            ).raise_for_status()
+                        )
+                    except Exception:
+                        continue
 
-        threading.Thread(target=_heartbeat, daemon=True).start()
+            threading.Thread(target=_heartbeat, daemon=True).start()
+            try:
+                return _execute(client, checkout)
+            finally:
+                stop_heartbeat.set()
+    except Exception as exc:
+        print(f"Runner failed: {exc}", file=sys.stderr)
         try:
-            return _execute(client, checkout)
-        finally:
-            stop_heartbeat.set()
+            with httpx.Client() as client:
+                _post_progress(
+                    client,
+                    execution_status="FAILED",
+                    phase="finished",
+                    failed_stage="runner",
+                )
+        except Exception:
+            pass
+        return 1
 
 
 def _execute(client: httpx.Client, checkout: Path) -> int:
