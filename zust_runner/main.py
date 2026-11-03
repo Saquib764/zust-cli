@@ -123,13 +123,23 @@ def _validate_repo_relative_path(checkout: Path, config_path: str) -> Path:
     return destination
 
 
-def _write_config_bytes(checkout: Path, config_path: str, content: bytes) -> None:
-    destination = _validate_repo_relative_path(checkout, config_path)
+def _write_bytes_atomic(destination: Path, content: bytes) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("wb", delete=False, dir=destination.parent) as handle:
         handle.write(content)
         temp_name = handle.name
     os.replace(temp_name, destination)
+
+
+def _write_config_bytes(checkout: Path, config_path: str, content: bytes) -> None:
+    destination = _validate_repo_relative_path(checkout, config_path)
+    _write_bytes_atomic(destination, content)
+
+
+def _write_repo_dotenv(checkout: Path, content: bytes) -> None:
+    if not content.strip():
+        return
+    _write_bytes_atomic(checkout / ".env", content)
 
 
 def _clone_commit(checkout: Path, client: httpx.Client) -> None:
@@ -226,6 +236,14 @@ def _execute(client: httpx.Client, checkout: Path) -> int:
     )
     config_response.raise_for_status()
     _write_config_bytes(checkout, CONFIG_PATH, config_response.content)
+
+    env_response = client.get(
+        f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/effective-env",
+        headers=_headers(),
+        timeout=30.0,
+    )
+    env_response.raise_for_status()
+    _write_repo_dotenv(checkout, env_response.content)
 
     if _post_progress(client, phase="training"):
         _post_progress(client, execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
