@@ -1,0 +1,27 @@
+[project]
+name = "zust-cli"
+version = "0.1.0"
+description = "In-pod training runner for Zust"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx",
+]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["zust_runner*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = ["-v", "--tb=short"]
