@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 import httpx
@@ -22,7 +23,15 @@ SETUP_ARGV = json.loads(os.environ.get("ZUST_SETUP_ARGV", "[]"))
 TRAINING_ARGV = json.loads(os.environ.get("ZUST_TRAINING_ARGV", "[]"))
 INFERENCE_ARGV = json.loads(os.environ.get("ZUST_INFERENCE_ARGV", "[]"))
 
-WORKSPACE_ROOT = Path("/workspace/runs") / RUN_ID
+_LOG_LOCK = threading.Lock()
+
+
+def resolve_workspace_root() -> Path:
+    """Run directory. Local launches set ZUST_WORKSPACE_ROOT; Runpod uses /workspace/runs/<id>."""
+    override = os.environ.get("ZUST_WORKSPACE_ROOT", "").strip()
+    if override:
+        return Path(override)
+    return Path("/workspace/runs") / os.environ.get("ZUST_RUN_ID", "")
 
 
 def _headers() -> dict[str, str]:
@@ -42,12 +51,18 @@ def _post_progress(client: httpx.Client, **fields) -> bool:
 
 
 def _append_log(client: httpx.Client, stream: str, line: str) -> None:
-    client.post(
-        f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/logs",
-        headers=_headers(),
-        json={"entries": [{"stream": stream, "line": line}]},
-        timeout=30.0,
-    ).raise_for_status()
+    with _LOG_LOCK:
+        client.post(
+            f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/logs",
+            headers=_headers(),
+            json={"entries": [{"stream": stream, "line": line}]},
+            timeout=30.0,
+        ).raise_for_status()
+
+
+def _drain(client: httpx.Client, stream: str, pipe) -> None:
+    for line in pipe:
+        _append_log(client, stream, line.rstrip("\n"))
 
 
 def _run_argv(client: httpx.Client, argv: list[str], cwd: Path) -> int:
@@ -63,11 +78,14 @@ def _run_argv(client: httpx.Client, argv: list[str], cwd: Path) -> int:
     )
     assert process.stdout is not None
     assert process.stderr is not None
-    for line in process.stdout:
-        _append_log(client, "stdout", line.rstrip("\n"))
-    for line in process.stderr:
-        _append_log(client, "stderr", line.rstrip("\n"))
-    return process.wait()
+    stdout_thread = threading.Thread(target=_drain, args=(client, "stdout", process.stdout), daemon=True)
+    stderr_thread = threading.Thread(target=_drain, args=(client, "stderr", process.stderr), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+    code = process.wait()
+    stdout_thread.join()
+    stderr_thread.join()
+    return code
 
 
 def _validate_repo_relative_path(checkout: Path, config_path: str) -> Path:
@@ -105,90 +123,112 @@ def run() -> int:
         print("Missing required runner environment", file=sys.stderr)
         return 2
 
-    checkout = WORKSPACE_ROOT / "repo"
+    checkout = resolve_workspace_root() / "repo"
+    with httpx.Client() as client:
+        stop_heartbeat = threading.Event()
+
+        def _heartbeat() -> None:
+            while not stop_heartbeat.wait(30):
+                try:
+                    client.post(
+                        f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/progress",
+                        headers=_headers(),
+                        json={},
+                        timeout=30.0,
+                    )
+                except Exception:
+                    continue
+
+        threading.Thread(target=_heartbeat, daemon=True).start()
+        try:
+            return _execute(client, checkout)
+        finally:
+            stop_heartbeat.set()
+
+
+def _execute(client: httpx.Client, checkout: Path) -> int:
     failed_stage: str | None = None
     setup_code: int | None = None
     training_code: int | None = None
     inference_code: int | None = None
     execution_status = "FAILED"
 
-    with httpx.Client() as client:
-        if _post_progress(client, phase="cloning", execution_status="RUNNING"):
+    if _post_progress(client, phase="cloning", execution_status="RUNNING"):
+        _post_progress(client, execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
+        return 130
+
+    _clone_commit(checkout, client)
+
+    if SETUP_ARGV:
+        if _post_progress(client, phase="setup"):
             _post_progress(client, execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
             return 130
-
-        _clone_commit(checkout, client)
-
-        if SETUP_ARGV:
-            if _post_progress(client, phase="setup"):
-                _post_progress(client, execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
-                return 130
-            setup_code = _run_argv(client, SETUP_ARGV, checkout)
-            if setup_code != 0:
-                failed_stage = "setup"
-                _post_progress(
-                    client,
-                    execution_status="FAILED",
-                    phase="finished",
-                    failed_stage=failed_stage,
-                    setup_exit_code=setup_code,
-                )
-                return setup_code
-
-        if _post_progress(client, phase="writing_config"):
-            _post_progress(client, execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
-            return 130
-
-        config_response = client.get(
-            f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/effective-config",
-            headers=_headers(),
-            timeout=30.0,
-        )
-        config_response.raise_for_status()
-        _write_config_bytes(checkout, CONFIG_PATH, config_response.content)
-
-        if _post_progress(client, phase="training"):
-            _post_progress(client, execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
-            return 130
-        training_code = _run_argv(client, TRAINING_ARGV, checkout)
-        if training_code != 0:
-            failed_stage = "training"
+        setup_code = _run_argv(client, SETUP_ARGV, checkout)
+        if setup_code != 0:
+            failed_stage = "setup"
             _post_progress(
                 client,
                 execution_status="FAILED",
                 phase="finished",
                 failed_stage=failed_stage,
                 setup_exit_code=setup_code,
-                training_exit_code=training_code,
             )
-            return training_code
+            return setup_code
 
-        execution_status = "COMPLETED"
-        if RUN_TEST_INFERENCE and INFERENCE_ARGV:
-            if _post_progress(client, phase="inference"):
-                _post_progress(client, execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
-                return 130
-            inference_code = _run_argv(client, INFERENCE_ARGV, checkout)
-            if inference_code != 0:
-                failed_stage = "inference"
-                execution_status = "FAILED"
-                _post_progress(
-                    client,
-                    execution_status=execution_status,
-                    phase="finished",
-                    failed_stage=failed_stage,
-                    setup_exit_code=setup_code,
-                    training_exit_code=training_code,
-                    inference_exit_code=inference_code,
-                )
-                return inference_code
+    if _post_progress(client, phase="writing_config"):
+        _post_progress(client, execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
+        return 130
 
+    config_response = client.get(
+        f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/effective-config",
+        headers=_headers(),
+        timeout=30.0,
+    )
+    config_response.raise_for_status()
+    _write_config_bytes(checkout, CONFIG_PATH, config_response.content)
+
+    if _post_progress(client, phase="training"):
+        _post_progress(client, execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
+        return 130
+    training_code = _run_argv(client, TRAINING_ARGV, checkout)
+    if training_code != 0:
+        failed_stage = "training"
         _post_progress(
             client,
-            execution_status=execution_status,
+            execution_status="FAILED",
             phase="finished",
+            failed_stage=failed_stage,
             setup_exit_code=setup_code,
             training_exit_code=training_code,
-            inference_exit_code=inference_code,
         )
+        return training_code
+
+    execution_status = "COMPLETED"
+    if RUN_TEST_INFERENCE and INFERENCE_ARGV:
+        if _post_progress(client, phase="inference"):
+            _post_progress(client, execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
+            return 130
+        inference_code = _run_argv(client, INFERENCE_ARGV, checkout)
+        if inference_code != 0:
+            failed_stage = "inference"
+            execution_status = "FAILED"
+            _post_progress(
+                client,
+                execution_status=execution_status,
+                phase="finished",
+                failed_stage=failed_stage,
+                setup_exit_code=setup_code,
+                training_exit_code=training_code,
+                inference_exit_code=inference_code,
+            )
+            return inference_code
+
+    _post_progress(
+        client,
+        execution_status=execution_status,
+        phase="finished",
+        setup_exit_code=setup_code,
+        training_exit_code=training_code,
+        inference_exit_code=inference_code,
+    )
     return 0
