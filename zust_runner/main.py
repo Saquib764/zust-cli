@@ -71,6 +71,10 @@ def _post_progress(client: httpx.Client, **fields) -> bool:
     return _with_retries(_send)
 
 
+def _cancel_requested(client: httpx.Client) -> bool:
+    return _post_progress(client)
+
+
 def _append_log(client: httpx.Client, stream: str, line: str) -> None:
     def _send() -> None:
         client.post(
@@ -106,7 +110,19 @@ def _run_argv(client: httpx.Client, argv: list[str], cwd: Path) -> int:
     stderr_thread = threading.Thread(target=_drain, args=(client, "stderr", process.stderr), daemon=True)
     stdout_thread.start()
     stderr_thread.start()
-    code = process.wait()
+    while process.poll() is None:
+        if _cancel_requested(client):
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            stdout_thread.join()
+            stderr_thread.join()
+            return 130
+        time.sleep(1.0)
+    code = process.returncode if process.returncode is not None else process.wait()
     stdout_thread.join()
     stderr_thread.join()
     return code
