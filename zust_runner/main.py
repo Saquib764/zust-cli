@@ -15,6 +15,7 @@ from pathlib import Path
 import httpx
 
 from zust_runner.metrics import run_training_with_metrics
+from zust_runner.outbound import RunOutbound
 
 API_BASE = os.environ.get("ZUST_API_BASE", "").rstrip("/")
 RUN_ID = os.environ.get("ZUST_RUN_ID", "")
@@ -58,38 +59,6 @@ def _with_retries(action):
     if last_error is not None:
         raise last_error
     raise RuntimeError("retry loop exited unexpectedly")
-
-
-def _post_progress(client: httpx.Client, **fields) -> bool:
-    def _send() -> bool:
-        response = client.post(
-            f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/progress",
-            headers=_headers(),
-            json=fields,
-            timeout=30.0,
-        )
-        response.raise_for_status()
-        data = response.json()
-        return bool(data.get("cancel"))
-
-    return _with_retries(_send)
-
-
-def _cancel_requested(client: httpx.Client) -> bool:
-    return _post_progress(client)
-
-
-def _append_log(client: httpx.Client, stream: str, line: str) -> None:
-    def _send() -> None:
-        client.post(
-            f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/logs",
-            headers=_headers(),
-            json={"entries": [{"stream": stream, "line": line}]},
-            timeout=30.0,
-        ).raise_for_status()
-
-    with _LOG_LOCK:
-        _with_retries(_send)
 
 
 class StreamSplitter:
@@ -196,7 +165,7 @@ class StreamSplitter:
         out.append(record)
 
 
-def _drain(client: httpx.Client, stream: str, pipe) -> None:
+def _drain(outbound: RunOutbound, stream: str, pipe) -> None:
     splitter = StreamSplitter()
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     while True:
@@ -204,14 +173,17 @@ def _drain(client: httpx.Client, stream: str, pipe) -> None:
         if not chunk:
             break
         for record in splitter.feed(decoder.decode(chunk)):
-            _append_log(client, stream, record)
+            with _LOG_LOCK:
+                outbound.append_log(stream, record)
     for record in splitter.feed(decoder.decode(b"", final=True)):
-        _append_log(client, stream, record)
+        with _LOG_LOCK:
+            outbound.append_log(stream, record)
     for record in splitter.finish():
-        _append_log(client, stream, record)
+        with _LOG_LOCK:
+            outbound.append_log(stream, record)
 
 
-def _run_argv(client: httpx.Client, argv: list[str], cwd: Path) -> int:
+def _run_argv(outbound: RunOutbound, argv: list[str], cwd: Path) -> int:
     if not argv:
         return 0
     process = subprocess.Popen(
@@ -224,12 +196,12 @@ def _run_argv(client: httpx.Client, argv: list[str], cwd: Path) -> int:
     )
     assert process.stdout is not None
     assert process.stderr is not None
-    stdout_thread = threading.Thread(target=_drain, args=(client, "stdout", process.stdout), daemon=True)
-    stderr_thread = threading.Thread(target=_drain, args=(client, "stderr", process.stderr), daemon=True)
+    stdout_thread = threading.Thread(target=_drain, args=(outbound, "stdout", process.stdout), daemon=True)
+    stderr_thread = threading.Thread(target=_drain, args=(outbound, "stderr", process.stderr), daemon=True)
     stdout_thread.start()
     stderr_thread.start()
     while process.poll() is None:
-        if _cancel_requested(client):
+        if outbound.post_progress():
             process.terminate()
             try:
                 process.wait(timeout=5)
@@ -283,14 +255,14 @@ def _github_remote_url(owner: str, repo: str) -> str:
     return f"https://github.com/{owner}/{repo}.git"
 
 
-def _clone_commit(checkout: Path, client: httpx.Client) -> None:
+def _clone_commit(checkout: Path, outbound: RunOutbound) -> None:
     owner, repo = REPOSITORY.split("/", 1)
     remote = _github_remote_url(owner, repo)
     checkout.mkdir(parents=True, exist_ok=True)
-    _run_argv(client, ["git", "init", "-b", GIT_BRANCH], checkout)
-    _run_argv(client, ["git", "remote", "add", "origin", remote], checkout)
-    _run_argv(client, ["git", "fetch", "--depth", "1", "origin", COMMIT_SHA], checkout)
-    _run_argv(client, ["git", "checkout", "--detach", "FETCH_HEAD"], checkout)
+    _run_argv(outbound, ["git", "init", "-b", GIT_BRANCH], checkout)
+    _run_argv(outbound, ["git", "remote", "add", "origin", remote], checkout)
+    _run_argv(outbound, ["git", "fetch", "--depth", "1", "origin", COMMIT_SHA], checkout)
+    _run_argv(outbound, ["git", "checkout", "--detach", "FETCH_HEAD"], checkout)
 
 
 def run() -> int:
@@ -299,66 +271,71 @@ def run() -> int:
         return 2
 
     checkout = resolve_workspace_root() / "repo"
+    cache_dir = resolve_workspace_root() / "outbound"
     try:
         with httpx.Client() as client:
+            outbound = RunOutbound(
+                client,
+                api_base=API_BASE,
+                run_id=RUN_ID,
+                headers=_headers(),
+                cache_dir=cache_dir,
+            )
             stop_heartbeat = threading.Event()
 
             def _heartbeat() -> None:
                 while not stop_heartbeat.wait(30):
-                    try:
-                        _with_retries(
-                            lambda: client.post(
-                                f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/progress",
-                                headers=_headers(),
-                                json={},
-                                timeout=30.0,
-                            ).raise_for_status()
-                        )
-                    except Exception:
-                        continue
+                    outbound.post_progress()
 
             threading.Thread(target=_heartbeat, daemon=True).start()
             try:
-                return _execute(client, checkout)
+                return _execute(client, outbound, checkout)
             finally:
                 stop_heartbeat.set()
+                outbound.flush()
     except Exception as exc:
         print(f"Runner failed: {exc}", file=sys.stderr)
         try:
             with httpx.Client() as client:
-                _post_progress(
+                failed_outbound = RunOutbound(
                     client,
+                    api_base=API_BASE,
+                    run_id=RUN_ID,
+                    headers=_headers(),
+                    cache_dir=cache_dir,
+                )
+                failed_outbound.post_progress(
                     execution_status="FAILED",
                     phase="finished",
                     failed_stage="runner",
                 )
+                failed_outbound.flush()
         except Exception:
             pass
         return 1
 
 
-def _execute(client: httpx.Client, checkout: Path) -> int:
+def _execute(client: httpx.Client, outbound: RunOutbound, checkout: Path) -> int:
     failed_stage: str | None = None
     setup_code: int | None = None
     training_code: int | None = None
     inference_code: int | None = None
     execution_status = "FAILED"
 
-    if _post_progress(client, phase="cloning", execution_status="RUNNING"):
-        _post_progress(client, execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
+    if outbound.post_progress(phase="cloning", execution_status="RUNNING"):
+        outbound.post_progress(execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
         return 130
 
-    _clone_commit(checkout, client)
+    _clone_commit(checkout, outbound)
 
     if SETUP_ARGV:
-        if _post_progress(client, phase="setup"):
-            _post_progress(client, execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
+        if outbound.post_progress(phase="setup"):
+            outbound.post_progress(execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
             return 130
-        setup_code = _run_argv(client, SETUP_ARGV, checkout)
+        setup_code = _run_argv(outbound, SETUP_ARGV, checkout)
         if setup_code != 0:
             failed_stage = "setup"
-            _post_progress(
-                client,
+            outbound.post_progress(
                 execution_status="FAILED",
                 phase="finished",
                 failed_stage=failed_stage,
@@ -366,8 +343,8 @@ def _execute(client: httpx.Client, checkout: Path) -> int:
             )
             return setup_code
 
-    if _post_progress(client, phase="writing_config"):
-        _post_progress(client, execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
+    if outbound.post_progress(phase="writing_config"):
+        outbound.post_progress(execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
         return 130
 
     config_response = client.get(
@@ -386,24 +363,20 @@ def _execute(client: httpx.Client, checkout: Path) -> int:
     env_response.raise_for_status()
     _write_repo_dotenv(checkout, env_response.content)
 
-    if _post_progress(client, phase="training"):
-        _post_progress(client, execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
+    if outbound.post_progress(phase="training"):
+        outbound.post_progress(execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
         return 130
     training_code = run_training_with_metrics(
         client,
         TRAINING_ARGV,
         checkout,
         CONFIG_PATH,
-        api_base=API_BASE,
-        run_id=RUN_ID,
-        headers=_headers(),
-        run_argv=_run_argv,
-        send_with_retries=_with_retries,
+        run_argv=lambda _client, argv, cwd: _run_argv(outbound, argv, cwd),
+        post_metrics=outbound.post_metrics,
     )
     if training_code != 0:
         failed_stage = "training"
-        _post_progress(
-            client,
+        outbound.post_progress(
             execution_status="FAILED",
             phase="finished",
             failed_stage=failed_stage,
@@ -414,15 +387,14 @@ def _execute(client: httpx.Client, checkout: Path) -> int:
 
     execution_status = "COMPLETED"
     if RUN_TEST_INFERENCE and INFERENCE_ARGV:
-        if _post_progress(client, phase="inference"):
-            _post_progress(client, execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
+        if outbound.post_progress(phase="inference"):
+            outbound.post_progress(execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
             return 130
-        inference_code = _run_argv(client, INFERENCE_ARGV, checkout)
+        inference_code = _run_argv(outbound, INFERENCE_ARGV, checkout)
         if inference_code != 0:
             failed_stage = "inference"
             execution_status = "FAILED"
-            _post_progress(
-                client,
+            outbound.post_progress(
                 execution_status=execution_status,
                 phase="finished",
                 failed_stage=failed_stage,
@@ -432,8 +404,7 @@ def _execute(client: httpx.Client, checkout: Path) -> int:
             )
             return inference_code
 
-    _post_progress(
-        client,
+    outbound.post_progress(
         execution_status=execution_status,
         phase="finished",
         setup_exit_code=setup_code,

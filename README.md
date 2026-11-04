@@ -14,6 +14,8 @@ Python 3.10+ (Runpod training images ship 3.12; the runner itself does not requi
 
 Logs and phase updates are posted to `/api/v1/internal/runs/{id}/logs` and `/progress`. A carriage return in stdout is kept as its own record so progress bars overwrite one row in the UI.
 
+If the API is unreachable (5xx, timeouts, connection errors), those callbacks are appended to `<workspace>/outbound/pending.jsonl` instead of failing the run. Each later successful request replays the queue in order before sending new data.
+
 On Runpod the workspace is `/workspace/runs/<run_id>`. Local launches set `ZUST_WORKSPACE_ROOT`.
 
 ## Environment

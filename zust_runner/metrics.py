@@ -7,7 +7,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import httpx
 import yaml
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
@@ -81,45 +80,28 @@ def _collect_points(log_dir: Path, sent_max_step: dict[str, int]) -> list[dict[s
 
 
 def _append_metrics(
-    client: httpx.Client,
-    run_id: str,
-    headers: dict[str, str],
-    api_base: str,
     points: list[dict[str, Any]],
-    send_with_retries,
+    post_metrics,
 ) -> None:
     if not points:
         return
     for start in range(0, len(points), _MAX_POINTS):
         batch = points[start : start + _MAX_POINTS]
-
-        def _send(batch=batch):
-            client.post(
-                f"{api_base}/api/v1/internal/runs/{run_id}/metrics",
-                headers=headers,
-                json={"points": batch},
-                timeout=30.0,
-            ).raise_for_status()
-
-        send_with_retries(_send)
+        post_metrics(batch)
 
 
 def tail_training_metrics(
-    client: httpx.Client,
     *,
-    api_base: str,
-    run_id: str,
-    headers: dict[str, str],
     log_dir: Path,
     stop: threading.Event,
-    send_with_retries,
+    post_metrics,
 ) -> None:
     sent_max_step: dict[str, int] = {}
     while not stop.wait(_POLL_SECONDS):
         points = _collect_points(log_dir, sent_max_step)
-        _append_metrics(client, run_id, headers, api_base, points, send_with_retries)
+        _append_metrics(points, post_metrics)
     points = _collect_points(log_dir, sent_max_step)
-    _append_metrics(client, run_id, headers, api_base, points, send_with_retries)
+    _append_metrics(points, post_metrics)
 
 
 def run_training_with_metrics(
@@ -128,11 +110,8 @@ def run_training_with_metrics(
     checkout: Path,
     config_rel: str,
     *,
-    api_base: str,
-    run_id: str,
-    headers: dict[str, str],
     run_argv,
-    send_with_retries,
+    post_metrics,
 ) -> int:
     log_dir = resolve_training_log_dir(checkout, config_rel)
     stop = threading.Event()
@@ -140,14 +119,10 @@ def run_training_with_metrics(
     if log_dir is not None:
         tail_thread = threading.Thread(
             target=tail_training_metrics,
-            args=(client,),
             kwargs={
-                "api_base": api_base,
-                "run_id": run_id,
-                "headers": headers,
                 "log_dir": log_dir,
                 "stop": stop,
-                "send_with_retries": send_with_retries,
+                "post_metrics": post_metrics,
             },
             daemon=True,
         )
