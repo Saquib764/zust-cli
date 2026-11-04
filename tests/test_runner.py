@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from zust_runner.main import (
+    StreamSplitter,
     _validate_repo_relative_path,
     _write_repo_dotenv,
     resolve_workspace_root,
@@ -36,6 +37,36 @@ def test_write_repo_dotenv_writes_file():
         root = Path(tmp)
         _write_repo_dotenv(root, b"HF_TOKEN=x\n")
         assert (root / ".env").read_text() == "HF_TOKEN=x\n"
+
+
+def test_progress_carriage_return_updates_one_row():
+    splitter = StreamSplitter()
+    records = splitter.feed("\rtrain 0 loss=3.8")
+    records += splitter.feed("\rtrain 1 loss=3.4")
+    records += splitter.feed("\rtrain 1 loss=3.4")
+    records += splitter.feed("\nsaved step 1\n")
+    records += splitter.feed("\rtrain 1 loss=3.4")
+    assert records == [
+        "\rtrain 0 loss=3.8",
+        "\rtrain 1 loss=3.4",
+        "\n",
+        "saved step 1",
+        "\rtrain 1 loss=3.4",
+    ]
+
+
+def test_progress_split_across_reads_stays_one_row():
+    splitter = StreamSplitter()
+    records = splitter.feed("\rtrain 0")
+    records += splitter.feed(" loss=3.8")
+    records += splitter.finish()
+    assert records == ["\rtrain 0", "\rtrain 0 loss=3.8"]
+
+
+def test_ordinary_lines_keep_newlines():
+    splitter = StreamSplitter()
+    records = splitter.feed("hello\n\nworld\r\n")
+    assert records == ["hello", "", "world"]
 
 
 def test_runner_rejects_traversal_path():

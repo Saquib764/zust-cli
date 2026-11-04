@@ -5,6 +5,8 @@ description = "In-pod training runner for Zust"
 requires-python = ">=3.12"
 dependencies = [
     "httpx",
+    "pyyaml>=6.0.2",
+    "tensorboard>=2.18.0",
 ]
 
 [build-system]

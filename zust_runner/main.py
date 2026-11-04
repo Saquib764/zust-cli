@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import subprocess
@@ -12,6 +13,8 @@ import time
 from pathlib import Path
 
 import httpx
+
+from zust_runner.metrics import run_training_with_metrics
 
 API_BASE = os.environ.get("ZUST_API_BASE", "").rstrip("/")
 RUN_ID = os.environ.get("ZUST_RUN_ID", "")
@@ -88,9 +91,123 @@ def _append_log(client: httpx.Client, stream: str, line: str) -> None:
         _with_retries(_send)
 
 
+class StreamSplitter:
+    """Turn a process byte stream into log records.
+
+    A newline ends a record. A carriage return, which is how progress bars
+    redraw the current row, is its own record prefixed with ``\\r`` so the
+    viewer can overwrite that row instead of appending another line.
+    """
+
+    def __init__(self) -> None:
+        self.buf = ""
+        self.overwrite = False
+        self.published = True
+        self.held_cr = False
+        self.last_cr: str | None = None
+
+    def feed(self, data: str) -> list[str]:
+        out: list[str] = []
+        if self.held_cr:
+            self.held_cr = False
+            if data.startswith("\n"):
+                out.extend(self._newline())
+                data = data[1:]
+            else:
+                self._enter_cr(out)
+        if data.endswith("\r") and not data.endswith("\r\n"):
+            self.held_cr = True
+            data = data[:-1]
+        self._consume(data, out)
+        if self.held_cr:
+            return out
+        if self.overwrite and self.buf and not self.published:
+            self._publish_cr(out)
+        return out
+
+    def finish(self) -> list[str]:
+        out: list[str] = []
+        if self.held_cr:
+            self.held_cr = False
+            self._enter_cr(out)
+        if self.buf and not self.published:
+            if self.overwrite:
+                self._publish_cr(out)
+            else:
+                out.append(self.buf)
+                self.buf = ""
+                self.published = True
+        return out
+
+    def _consume(self, data: str, out: list[str]) -> None:
+        index = 0
+        while index < len(data):
+            char = data[index]
+            if char == "\r" and index + 1 < len(data) and data[index + 1] == "\n":
+                out.extend(self._newline())
+                index += 2
+                continue
+            if char == "\r":
+                self._enter_cr(out)
+                index += 1
+                continue
+            if char == "\n":
+                out.extend(self._newline())
+                index += 1
+                continue
+            self.buf += char
+            self.published = False
+            index += 1
+
+    def _enter_cr(self, out: list[str]) -> None:
+        if self.buf and not self.published:
+            if self.overwrite:
+                self._publish_cr(out)
+            else:
+                out.append(self.buf)
+                self.last_cr = None
+        self.overwrite = True
+        self.buf = ""
+        self.published = True
+
+    def _newline(self) -> list[str]:
+        out: list[str] = []
+        if self.overwrite:
+            if self.buf and not self.published:
+                self._publish_cr(out)
+            out.append("\n")
+        else:
+            out.append(self.buf)
+        self.buf = ""
+        self.overwrite = False
+        self.published = True
+        self.last_cr = None
+        return out
+
+    def _publish_cr(self, out: list[str]) -> None:
+        self.published = True
+        if not self.buf.strip():
+            return
+        record = "\r" + self.buf
+        if record == self.last_cr:
+            return
+        self.last_cr = record
+        out.append(record)
+
+
 def _drain(client: httpx.Client, stream: str, pipe) -> None:
-    for line in pipe:
-        _append_log(client, stream, line.rstrip("\n"))
+    splitter = StreamSplitter()
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    while True:
+        chunk = pipe.read(4096)
+        if not chunk:
+            break
+        for record in splitter.feed(decoder.decode(chunk)):
+            _append_log(client, stream, record)
+    for record in splitter.feed(decoder.decode(b"", final=True)):
+        _append_log(client, stream, record)
+    for record in splitter.finish():
+        _append_log(client, stream, record)
 
 
 def _run_argv(client: httpx.Client, argv: list[str], cwd: Path) -> int:
@@ -101,7 +218,7 @@ def _run_argv(client: httpx.Client, argv: list[str], cwd: Path) -> int:
         cwd=str(cwd),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
+        bufsize=0,
         shell=False,
     )
     assert process.stdout is not None
@@ -264,7 +381,17 @@ def _execute(client: httpx.Client, checkout: Path) -> int:
     if _post_progress(client, phase="training"):
         _post_progress(client, execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
         return 130
-    training_code = _run_argv(client, TRAINING_ARGV, checkout)
+    training_code = run_training_with_metrics(
+        client,
+        TRAINING_ARGV,
+        checkout,
+        CONFIG_PATH,
+        api_base=API_BASE,
+        run_id=RUN_ID,
+        headers=_headers(),
+        run_argv=_run_argv,
+        send_with_retries=_with_retries,
+    )
     if training_code != 0:
         failed_stage = "training"
         _post_progress(
