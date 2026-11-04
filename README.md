@@ -2,7 +2,7 @@
 
 In-pod training runner for Zust. The [zust-ai-be](https://github.com/Saquib764/zust-ai-be) API starts this process for one run. It is not a user-facing CLI.
 
-Python 3.12+. Dependencies are managed with [uv](https://docs.astral.sh/uv/).
+Python 3.10+ (Runpod training images ship 3.12; the runner itself does not require 3.12). Dependencies are managed with [uv](https://docs.astral.sh/uv/).
 
 ## What it does
 
