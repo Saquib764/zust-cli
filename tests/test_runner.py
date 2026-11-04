@@ -7,6 +7,7 @@ import pytest
 
 from zust_runner.main import (
     StreamSplitter,
+    _github_remote_url,
     _validate_repo_relative_path,
     _write_repo_dotenv,
     resolve_workspace_root,
@@ -17,6 +18,17 @@ def test_workspace_root_uses_callback_run_directory(monkeypatch):
     monkeypatch.setenv("ZUST_RUN_ID", "run_abc")
     monkeypatch.setenv("ZUST_WORKSPACE_ROOT", "/tmp/zust-workspace/run_abc")
     assert resolve_workspace_root() == Path("/tmp/zust-workspace/run_abc")
+
+
+def test_github_remote_url_uses_token_when_set(monkeypatch):
+    monkeypatch.setenv("ZUST_GITHUB_TOKEN", "gh_secret")
+    url = _github_remote_url("acme", "models")
+    assert url == "https://x-access-token:gh_secret@github.com/acme/models.git"
+
+
+def test_github_remote_url_is_anonymous_without_token(monkeypatch):
+    monkeypatch.delenv("ZUST_GITHUB_TOKEN", raising=False)
+    assert _github_remote_url("acme", "models") == "https://github.com/acme/models.git"
 
 
 def test_workspace_root_defaults_to_pod_volume(monkeypatch):

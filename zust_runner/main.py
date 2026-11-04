@@ -275,9 +275,16 @@ def _write_repo_dotenv(checkout: Path, content: bytes) -> None:
     _write_bytes_atomic(checkout / ".env", content)
 
 
+def _github_remote_url(owner: str, repo: str) -> str:
+    token = os.environ.get("ZUST_GITHUB_TOKEN", "").strip()
+    if token:
+        return f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
+    return f"https://github.com/{owner}/{repo}.git"
+
+
 def _clone_commit(checkout: Path, client: httpx.Client) -> None:
     owner, repo = REPOSITORY.split("/", 1)
-    remote = f"https://github.com/{owner}/{repo}.git"
+    remote = _github_remote_url(owner, repo)
     checkout.mkdir(parents=True, exist_ok=True)
     _run_argv(client, ["git", "init"], checkout)
     _run_argv(client, ["git", "remote", "add", "origin", remote], checkout)
