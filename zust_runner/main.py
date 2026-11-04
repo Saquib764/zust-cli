@@ -21,6 +21,7 @@ RUN_ID = os.environ.get("ZUST_RUN_ID", "")
 RUN_TOKEN = os.environ.get("ZUST_RUN_TOKEN", "")
 REPOSITORY = os.environ.get("ZUST_REPOSITORY", "")
 COMMIT_SHA = os.environ.get("ZUST_COMMIT_SHA", "")
+GIT_BRANCH = (os.environ.get("ZUST_GIT_BRANCH", "main") or "main").strip() or "main"
 CONFIG_PATH = os.environ.get("ZUST_CONFIG_PATH", "")
 RUN_TEST_INFERENCE = os.environ.get("ZUST_RUN_TEST_INFERENCE", "0") == "1"
 SETUP_ARGV = json.loads(os.environ.get("ZUST_SETUP_ARGV", "[]"))
@@ -286,7 +287,7 @@ def _clone_commit(checkout: Path, client: httpx.Client) -> None:
     owner, repo = REPOSITORY.split("/", 1)
     remote = _github_remote_url(owner, repo)
     checkout.mkdir(parents=True, exist_ok=True)
-    _run_argv(client, ["git", "init"], checkout)
+    _run_argv(client, ["git", "init", "-b", GIT_BRANCH], checkout)
     _run_argv(client, ["git", "remote", "add", "origin", remote], checkout)
     _run_argv(client, ["git", "fetch", "--depth", "1", "origin", COMMIT_SHA], checkout)
     _run_argv(client, ["git", "checkout", "--detach", "FETCH_HEAD"], checkout)
