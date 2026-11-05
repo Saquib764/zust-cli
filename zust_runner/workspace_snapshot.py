@@ -10,7 +10,25 @@ from typing import Any
 from zust_runner.main import resolve_workspace_root
 
 _MAX_ENTRIES = 8000
-_SKIP_DIR_NAMES = frozenset({"__pycache__", ".git", ".venv"})
+_SKIP_DIR_NAMES = frozenset(
+    {
+        "__pycache__",
+        ".git",
+        ".venv",
+        ".pytest_cache",
+        ".eggs",
+        ".mypy_cache",
+        ".ruff_cache",
+    }
+)
+
+
+def _skip_dir_name(name: str) -> bool:
+    return name in _SKIP_DIR_NAMES or name.endswith(".egg-info")
+
+
+def _skip_file_name(name: str) -> bool:
+    return name.endswith((".pyc", ".pyo"))
 
 
 def repo_root() -> Path:
@@ -34,7 +52,7 @@ def scan_workspace_root() -> list[dict[str, Any]]:
         entries.append(row)
 
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [name for name in dirnames if name not in _SKIP_DIR_NAMES]
+        dirnames[:] = [name for name in dirnames if not _skip_dir_name(name)]
         current = Path(dirpath)
         try:
             rel_dir = current.relative_to(root).as_posix()
@@ -45,6 +63,8 @@ def scan_workspace_root() -> list[dict[str, Any]]:
 
         for name in filenames:
             if name.startswith("."):
+                continue
+            if _skip_file_name(name):
                 continue
             file_path = current / name
             try:
