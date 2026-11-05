@@ -168,7 +168,7 @@ def _sleep_poll() -> None:
 
 
 def _session_cancelled(session: dict[str, Any]) -> bool:
-    return bool(session.get("cancel")) or str(session.get("execution_status") or "") == "CANCELLED"
+    return bool(session.get("run_cancelled")) or str(session.get("execution_status") or "") == "CANCELLED"
 
 
 def _wait_for_work(client: httpx.Client, *, after_epoch: int) -> dict[str, Any]:

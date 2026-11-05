@@ -69,7 +69,19 @@ def _handle_control(outbound: RunOutbound, **fields: Any) -> int | None:
     if exit_code is None:
         return None
     if exit_code == 130:
-        outbound.post_progress(execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
+        if outbound._last_run_cancelled:
+            outbound.post_progress(
+                execution_status="CANCELLED",
+                phase="finished",
+                failed_stage="cancelled",
+            )
+        else:
+            outbound.post_progress(
+                execution_status="FAILED",
+                phase="finished",
+                failed_stage="stopped",
+                cancel_requested=False,
+            )
     return exit_code
 
 

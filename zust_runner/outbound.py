@@ -40,6 +40,7 @@ class RunOutbound:
         self._queue_path = self._cache_dir / "pending.jsonl"
         self._lock = threading.Lock()
         self._runner_epoch = runner_epoch
+        self._last_run_cancelled = False
 
     def flush(self) -> None:
         with self._lock:
@@ -133,6 +134,7 @@ class RunOutbound:
             response.raise_for_status()
             data = response.json()
             if bool(data.get("cancel")):
+                self._last_run_cancelled = bool(data.get("run_cancelled"))
                 return 1
             pending = data.get("pending_action")
             if isinstance(pending, dict) and pending.get("type") == "purge_workspace":
