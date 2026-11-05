@@ -9,17 +9,11 @@ from typing import Any
 
 import httpx
 
-from zust_runner.http_client import with_transport_retries
-
-_RETRIABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+from zust_runner.http_client import is_retriable_api_error, with_transport_retries
 
 
 def _is_retriable(exc: BaseException) -> bool:
-    if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):
-        return True
-    if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code in _RETRIABLE_STATUS
-    return False
+    return is_retriable_api_error(exc)
 
 
 class RunOutbound:

@@ -11,6 +11,15 @@ import httpx
 _T = TypeVar("_T")
 
 _DEFAULT_TIMEOUT = httpx.Timeout(60.0, connect=45.0)
+_RETRIABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def is_retriable_api_error(exc: BaseException) -> bool:
+    if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in _RETRIABLE_STATUS
+    return False
 
 
 def api_base() -> str:

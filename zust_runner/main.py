@@ -19,6 +19,7 @@ from typing import Any
 from zust_runner.http_client import create_runner_client, merge_runner_headers, with_transport_retries
 from zust_runner.metrics import run_training_with_metrics
 from zust_runner.outbound import RunOutbound
+from zust_runner.runner_cache import EFFECTIVE_CONFIG_FILE, EFFECTIVE_ENV_FILE, fetch_cached_bytes, outbound_dir
 
 API_BASE = os.environ.get("ZUST_API_BASE", "").rstrip("/")
 RUN_ID = os.environ.get("ZUST_RUN_ID", "")
@@ -233,6 +234,32 @@ def _with_uv_flag(argv: list[str], flag: str, value: str | None = None) -> list[
     return [*argv[:2], flag, value, *argv[2:]]
 
 
+# PyPI torch wheels pull these in; Runpod PyTorch images already ship CUDA libs on the system interpreter.
+_IMAGE_TORCH_SKIP_PACKAGES = (
+    "torch",
+    "triton",
+    "nvidia-cublas-cu12",
+    "nvidia-cuda-cupti-cu12",
+    "nvidia-cuda-nvrtc-cu12",
+    "nvidia-cudnn-cu12",
+    "nvidia-cufft-cu12",
+    "nvidia-curand-cu12",
+    "nvidia-cusolver-cu12",
+    "nvidia-cusparse-cu12",
+    "nvidia-cusparselt-cu12",
+    "nvidia-nccl-cu12",
+    "nvidia-nvjitlink-cu12",
+    "nvidia-nvtx-cu12",
+)
+
+
+def _with_uv_skip_image_torch_packages(argv: list[str]) -> list[str]:
+    result = argv
+    for package in _IMAGE_TORCH_SKIP_PACKAGES:
+        result = _with_uv_flag(result, "--no-install-package", package)
+    return result
+
+
 def _image_torch_steps(argv: list[str], cwd: Path) -> tuple[list[list[str]], list[str]]:
     """Keep the image's PyTorch instead of downloading the PyPI wheel into .venv.
 
@@ -250,9 +277,9 @@ def _image_torch_steps(argv: list[str], cwd: Path) -> tuple[list[list[str]], lis
             ["uv", "venv", "--python", sys.executable, "--system-site-packages", ".venv"]
         )
     if argv[1] == "run":
-        prelude.append(["uv", "sync", "--no-install-package", "torch"])
+        prelude.append(_with_uv_skip_image_torch_packages(["uv", "sync"]))
         return prelude, _with_uv_flag(argv, "--no-sync")
-    return prelude, _with_uv_flag(argv, "--no-install-package", "torch")
+    return prelude, _with_uv_skip_image_torch_packages(argv)
 
 
 def _run_argv(outbound: RunOutbound, argv: list[str], cwd: Path) -> int:
@@ -462,26 +489,21 @@ def _execute(client: httpx.Client, outbound: RunOutbound, checkout: Path) -> int
     if interrupted is not None:
         return interrupted
 
-    def _fetch_config() -> bytes:
-        response = client.get(
-            f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/effective-config",
-            headers=_headers(),
-            timeout=60.0,
-        )
-        response.raise_for_status()
-        return response.content
-
-    def _fetch_env() -> bytes:
-        response = client.get(
-            f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/effective-env",
-            headers=_headers(),
-            timeout=60.0,
-        )
-        response.raise_for_status()
-        return response.content
-
-    _write_config_bytes(checkout, CONFIG_PATH, with_transport_retries(_fetch_config))
-    _write_repo_dotenv(checkout, with_transport_retries(_fetch_env))
+    cache_root = outbound_dir()
+    config_bytes = fetch_cached_bytes(
+        client,
+        url=f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/effective-config",
+        headers=_headers(),
+        cache_path=cache_root / EFFECTIVE_CONFIG_FILE,
+    )
+    env_bytes = fetch_cached_bytes(
+        client,
+        url=f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/effective-env",
+        headers=_headers(),
+        cache_path=cache_root / EFFECTIVE_ENV_FILE,
+    )
+    _write_config_bytes(checkout, CONFIG_PATH, config_bytes)
+    _write_repo_dotenv(checkout, env_bytes)
 
     interrupted = _handle_control(outbound, phase="training")
     if interrupted is not None:

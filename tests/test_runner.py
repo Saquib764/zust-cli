@@ -11,6 +11,7 @@ from zust_runner.main import (
     _github_remote_url,
     _image_torch_steps,
     _validate_repo_relative_path,
+    _with_uv_skip_image_torch_packages,
     _write_repo_dotenv,
     resolve_workspace_root,
 )
@@ -89,7 +90,7 @@ def test_image_torch_sync_skips_torch_install(monkeypatch, tmp_path):
     assert prelude == [
         ["uv", "venv", "--python", sys.executable, "--system-site-packages", ".venv"]
     ]
-    assert argv == ["uv", "sync", "--no-install-package", "torch"]
+    assert argv == _with_uv_skip_image_torch_packages(["uv", "sync"])
 
 
 def test_image_torch_run_reuses_venv_without_syncing_torch(monkeypatch, tmp_path):
@@ -98,7 +99,7 @@ def test_image_torch_run_reuses_venv_without_syncing_torch(monkeypatch, tmp_path
     venv.mkdir()
     (venv / "pyvenv.cfg").write_text("home = /usr/bin\ninclude-system-site-packages = true\n")
     prelude, argv = _image_torch_steps(["uv", "run", "gemma-author-probe", "train"], tmp_path)
-    assert prelude == [["uv", "sync", "--no-install-package", "torch"]]
+    assert prelude == [_with_uv_skip_image_torch_packages(["uv", "sync"])]
     assert argv == ["uv", "run", "--no-sync", "gemma-author-probe", "train"]
 
 
