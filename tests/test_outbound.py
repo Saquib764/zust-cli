@@ -39,6 +39,31 @@ def test_queues_logs_on_503_then_flushes(tmp_path: Path) -> None:
     assert len(calls) == 2
 
 
+def test_progress_returns_purge_before_restart(tmp_path: Path) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "cancel": False,
+                "runner_epoch": 4,
+                "pending_action": {"type": "purge_workspace"},
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.Client(transport=transport, base_url="https://api.test")
+    outbound = RunOutbound(
+        client,
+        api_base="https://api.test",
+        run_id="run_1",
+        headers={"Authorization": "Bearer t"},
+        cache_dir=tmp_path,
+        runner_epoch=1,
+    )
+    assert outbound.post_progress(phase="training") == 3
+
+
 def test_progress_does_not_raise_on_transport_error(tmp_path: Path) -> None:
     transport = httpx.MockTransport(lambda _request: httpx.Response(503))
     client = httpx.Client(transport=transport, base_url="https://api.test")
@@ -49,5 +74,5 @@ def test_progress_does_not_raise_on_transport_error(tmp_path: Path) -> None:
         headers={"Authorization": "Bearer t"},
         cache_dir=tmp_path,
     )
-    assert outbound.post_progress(phase="training") is False
+    assert outbound.post_progress(phase="training") == 0
     assert outbound._queue_path.exists()

@@ -30,6 +30,43 @@ TRAINING_ARGV = json.loads(os.environ.get("ZUST_TRAINING_ARGV", "[]"))
 INFERENCE_ARGV = json.loads(os.environ.get("ZUST_INFERENCE_ARGV", "[]"))
 
 _LOG_LOCK = threading.Lock()
+RESTART_EXIT_CODE = 143
+PURGE_EXIT_CODE = 144
+
+
+def _runner_epoch() -> int:
+    return int(os.environ.get("ZUST_RUNNER_EPOCH", "1") or "1")
+
+
+def _warm_restart() -> bool:
+    return os.environ.get("ZUST_WARM_RESTART", "").strip() == "1"
+
+
+def _skip_setup() -> bool:
+    return os.environ.get("ZUST_SKIP_SETUP", "").strip() == "1"
+
+
+def _control_exit(control: int) -> int | None:
+    if control == 2:
+        return RESTART_EXIT_CODE
+    if control == 3:
+        return PURGE_EXIT_CODE
+    if control:
+        return 130
+    return None
+
+
+def _stopped_for_control(code: int) -> bool:
+    return code in (RESTART_EXIT_CODE, PURGE_EXIT_CODE)
+
+
+def _handle_control(outbound: RunOutbound, **fields: Any) -> int | None:
+    exit_code = _control_exit(outbound.post_progress(**fields))
+    if exit_code is None:
+        return None
+    if exit_code == 130:
+        outbound.post_progress(execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
+    return exit_code
 
 
 def resolve_workspace_root() -> Path:
@@ -183,12 +220,71 @@ def _drain(outbound: RunOutbound, stream: str, pipe) -> None:
             outbound.append_log(stream, record)
 
 
+def _use_image_torch() -> bool:
+    return os.environ.get("ZUST_USE_IMAGE_TORCH", "").strip() == "1"
+
+
+def _venv_includes_system_site_packages(cwd: Path) -> bool:
+    config = cwd / ".venv" / "pyvenv.cfg"
+    if not config.is_file():
+        return False
+    for line in config.read_text().splitlines():
+        if line.strip() == "include-system-site-packages = true":
+            return True
+    return False
+
+
+def _with_uv_flag(argv: list[str], flag: str, value: str | None = None) -> list[str]:
+    if value is None:
+        if flag in argv:
+            return argv
+        return [*argv[:2], flag, *argv[2:]]
+    for index, token in enumerate(argv):
+        if token == flag and index + 1 < len(argv) and argv[index + 1] == value:
+            return argv
+        if token == f"{flag}={value}":
+            return argv
+    return [*argv[:2], flag, value, *argv[2:]]
+
+
+def _image_torch_steps(argv: list[str], cwd: Path) -> tuple[list[list[str]], list[str]]:
+    """Keep the image's PyTorch instead of downloading the PyPI wheel into .venv.
+
+    uv sync installs torch, and the CUDA nvidia wheels it depends on, into an
+    isolated virtualenv. uv run syncs again before the command. On a Runpod
+    PyTorch image those packages are already on the system interpreter.
+    """
+    if not _use_image_torch() or len(argv) < 2 or Path(argv[0]).name != "uv":
+        return [], argv
+    if argv[1] not in {"sync", "run"}:
+        return [], argv
+    prelude: list[list[str]] = []
+    if not _venv_includes_system_site_packages(cwd):
+        prelude.append(
+            ["uv", "venv", "--python", sys.executable, "--system-site-packages", ".venv"]
+        )
+    if argv[1] == "run":
+        prelude.append(["uv", "sync", "--no-install-package", "torch"])
+        return prelude, _with_uv_flag(argv, "--no-sync")
+    return prelude, _with_uv_flag(argv, "--no-install-package", "torch")
+
+
 def _run_argv(outbound: RunOutbound, argv: list[str], cwd: Path) -> int:
     if not argv:
         return 0
+    prelude, argv = _image_torch_steps(argv, cwd)
+    for step in prelude:
+        code = _run_argv(outbound, step, cwd)
+        if code != 0:
+            return code
+    env = None
+    if _use_image_torch():
+        env = os.environ.copy()
+        env["UV_PYTHON_PREFERENCE"] = "only-system"
     process = subprocess.Popen(
         argv,
         cwd=str(cwd),
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=0,
@@ -201,7 +297,8 @@ def _run_argv(outbound: RunOutbound, argv: list[str], cwd: Path) -> int:
     stdout_thread.start()
     stderr_thread.start()
     while process.poll() is None:
-        if outbound.post_progress():
+        exit_code = _control_exit(outbound.post_progress())
+        if exit_code is not None:
             process.terminate()
             try:
                 process.wait(timeout=5)
@@ -210,7 +307,7 @@ def _run_argv(outbound: RunOutbound, argv: list[str], cwd: Path) -> int:
                 process.wait()
             stdout_thread.join()
             stderr_thread.join()
-            return 130
+            return exit_code
         time.sleep(1.0)
     code = process.returncode if process.returncode is not None else process.wait()
     stdout_thread.join()
@@ -255,7 +352,22 @@ def _github_remote_url(owner: str, repo: str) -> str:
     return f"https://github.com/{owner}/{repo}.git"
 
 
+def _maybe_clean_tensorboard(outbound: RunOutbound, checkout: Path) -> None:
+    if os.environ.get("ZUST_CLEAN_TENSORBOARD") != "1":
+        return
+    from zust_runner.tensorboard_clean import clean_tensorboard_events
+
+    removed = clean_tensorboard_events(checkout, CONFIG_PATH)
+    outbound.append_log(
+        "stdout",
+        f"Cleared {removed} TensorBoard event file(s) before training restart.",
+    )
+    outbound.post_progress(runner_clean_tensorboard=False)
+
+
 def _clone_commit(checkout: Path, outbound: RunOutbound) -> None:
+    if _warm_restart() and (checkout / ".git").is_dir():
+        return
     owner, repo = REPOSITORY.split("/", 1)
     remote = _github_remote_url(owner, repo)
     checkout.mkdir(parents=True, exist_ok=True)
@@ -280,12 +392,19 @@ def run() -> int:
                 run_id=RUN_ID,
                 headers=_headers(),
                 cache_dir=cache_dir,
+                runner_epoch=_runner_epoch(),
             )
             stop_heartbeat = threading.Event()
 
             def _heartbeat() -> None:
+                from zust_runner.workspace_snapshot import workspace_snapshot_payload
+
                 while not stop_heartbeat.wait(30):
                     outbound.post_progress()
+                    try:
+                        outbound.post_workspace_snapshot(workspace_snapshot_payload())
+                    except Exception:
+                        pass
 
             threading.Thread(target=_heartbeat, daemon=True).start()
             try:
@@ -303,6 +422,7 @@ def run() -> int:
                     run_id=RUN_ID,
                     headers=_headers(),
                     cache_dir=cache_dir,
+                    runner_epoch=_runner_epoch(),
                 )
                 failed_outbound.post_progress(
                     execution_status="FAILED",
@@ -322,17 +442,26 @@ def _execute(client: httpx.Client, outbound: RunOutbound, checkout: Path) -> int
     inference_code: int | None = None
     execution_status = "FAILED"
 
-    if outbound.post_progress(phase="cloning", execution_status="RUNNING"):
-        outbound.post_progress(execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
-        return 130
+    interrupted = _handle_control(outbound, phase="cloning", execution_status="RUNNING")
+    if interrupted is not None:
+        return interrupted
 
     _clone_commit(checkout, outbound)
+    _maybe_clean_tensorboard(outbound, checkout)
+    try:
+        from zust_runner.workspace_snapshot import workspace_snapshot_payload
 
-    if SETUP_ARGV:
-        if outbound.post_progress(phase="setup"):
-            outbound.post_progress(execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
-            return 130
+        outbound.post_workspace_snapshot(workspace_snapshot_payload())
+    except Exception:
+        pass
+
+    if SETUP_ARGV and not _skip_setup():
+        interrupted = _handle_control(outbound, phase="setup")
+        if interrupted is not None:
+            return interrupted
         setup_code = _run_argv(outbound, SETUP_ARGV, checkout)
+        if _stopped_for_control(setup_code):
+            return setup_code
         if setup_code != 0:
             failed_stage = "setup"
             outbound.post_progress(
@@ -343,9 +472,9 @@ def _execute(client: httpx.Client, outbound: RunOutbound, checkout: Path) -> int
             )
             return setup_code
 
-    if outbound.post_progress(phase="writing_config"):
-        outbound.post_progress(execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
-        return 130
+    interrupted = _handle_control(outbound, phase="writing_config")
+    if interrupted is not None:
+        return interrupted
 
     config_response = client.get(
         f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/effective-config",
@@ -363,9 +492,9 @@ def _execute(client: httpx.Client, outbound: RunOutbound, checkout: Path) -> int
     env_response.raise_for_status()
     _write_repo_dotenv(checkout, env_response.content)
 
-    if outbound.post_progress(phase="training"):
-        outbound.post_progress(execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
-        return 130
+    interrupted = _handle_control(outbound, phase="training")
+    if interrupted is not None:
+        return interrupted
     training_code = run_training_with_metrics(
         client,
         TRAINING_ARGV,
@@ -374,6 +503,8 @@ def _execute(client: httpx.Client, outbound: RunOutbound, checkout: Path) -> int
         run_argv=lambda _client, argv, cwd: _run_argv(outbound, argv, cwd),
         post_metrics=outbound.post_metrics,
     )
+    if _stopped_for_control(training_code):
+        return training_code
     if training_code != 0:
         failed_stage = "training"
         outbound.post_progress(
@@ -387,10 +518,12 @@ def _execute(client: httpx.Client, outbound: RunOutbound, checkout: Path) -> int
 
     execution_status = "COMPLETED"
     if RUN_TEST_INFERENCE and INFERENCE_ARGV:
-        if outbound.post_progress(phase="inference"):
-            outbound.post_progress(execution_status="CANCELLED", phase="finished", failed_stage="cancelled")
-            return 130
+        interrupted = _handle_control(outbound, phase="inference")
+        if interrupted is not None:
+            return interrupted
         inference_code = _run_argv(outbound, INFERENCE_ARGV, checkout)
+        if _stopped_for_control(inference_code):
+            return inference_code
         if inference_code != 0:
             failed_stage = "inference"
             execution_status = "FAILED"

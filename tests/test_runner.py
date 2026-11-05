@@ -1,5 +1,6 @@
 """Runner path checks."""
 
+import sys
 import tempfile
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 from zust_runner.main import (
     StreamSplitter,
     _github_remote_url,
+    _image_torch_steps,
     _validate_repo_relative_path,
     _write_repo_dotenv,
     resolve_workspace_root,
@@ -79,6 +81,32 @@ def test_ordinary_lines_keep_newlines():
     splitter = StreamSplitter()
     records = splitter.feed("hello\n\nworld\r\n")
     assert records == ["hello", "", "world"]
+
+
+def test_image_torch_sync_skips_torch_install(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZUST_USE_IMAGE_TORCH", "1")
+    prelude, argv = _image_torch_steps(["uv", "sync"], tmp_path)
+    assert prelude == [
+        ["uv", "venv", "--python", sys.executable, "--system-site-packages", ".venv"]
+    ]
+    assert argv == ["uv", "sync", "--no-install-package", "torch"]
+
+
+def test_image_torch_run_reuses_venv_without_syncing_torch(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZUST_USE_IMAGE_TORCH", "1")
+    venv = tmp_path / ".venv"
+    venv.mkdir()
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\ninclude-system-site-packages = true\n")
+    prelude, argv = _image_torch_steps(["uv", "run", "gemma-author-probe", "train"], tmp_path)
+    assert prelude == [["uv", "sync", "--no-install-package", "torch"]]
+    assert argv == ["uv", "run", "--no-sync", "gemma-author-probe", "train"]
+
+
+def test_image_torch_off_leaves_uv_commands_unchanged(monkeypatch, tmp_path):
+    monkeypatch.delenv("ZUST_USE_IMAGE_TORCH", raising=False)
+    prelude, argv = _image_torch_steps(["uv", "sync"], tmp_path)
+    assert prelude == []
+    assert argv == ["uv", "sync"]
 
 
 def test_runner_rejects_traversal_path():
