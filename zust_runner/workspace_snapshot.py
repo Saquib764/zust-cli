@@ -1,4 +1,4 @@
-"""Scan the run workspace and POST a flat file index to the API."""
+"""Scan the training repo and POST a flat file index to the API."""
 
 from __future__ import annotations
 
@@ -10,11 +10,15 @@ from typing import Any
 from zust_runner.main import resolve_workspace_root
 
 _MAX_ENTRIES = 8000
-_SKIP_DIR_NAMES = frozenset({"outbound", "__pycache__", ".git"})
+_SKIP_DIR_NAMES = frozenset({"__pycache__", ".git"})
+
+
+def repo_root() -> Path:
+    return resolve_workspace_root() / "repo"
 
 
 def scan_workspace_root() -> list[dict[str, Any]]:
-    root = resolve_workspace_root()
+    root = repo_root()
     if not root.is_dir():
         return []
     entries: list[dict[str, Any]] = []
@@ -38,8 +42,6 @@ def scan_workspace_root() -> list[dict[str, Any]]:
             continue
         if rel_dir and rel_dir != ".":
             add_directory(rel_dir, current.stat().st_mtime)
-        elif not rel_dir or rel_dir == ".":
-            rel_dir = ""
 
         for name in filenames:
             if name.startswith("."):
@@ -69,10 +71,11 @@ def scan_workspace_root() -> list[dict[str, Any]]:
 
 
 def workspace_snapshot_payload() -> dict[str, Any]:
-    root = resolve_workspace_root()
+    root = repo_root()
+    run_root = resolve_workspace_root()
     entries = scan_workspace_root()
     return {
-        "root": str(root) if root.is_dir() else f"/workspace/runs/{os.environ.get('ZUST_RUN_ID', '')}",
+        "root": str(root) if root.is_dir() else str(run_root / "repo"),
         "entries": entries,
         "truncated": len(entries) >= _MAX_ENTRIES,
     }

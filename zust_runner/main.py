@@ -14,6 +14,9 @@ from pathlib import Path
 
 import httpx
 
+from typing import Any
+
+from zust_runner.http_client import create_runner_client, merge_runner_headers, with_transport_retries
 from zust_runner.metrics import run_training_with_metrics
 from zust_runner.outbound import RunOutbound
 
@@ -78,24 +81,7 @@ def resolve_workspace_root() -> Path:
 
 
 def _headers() -> dict[str, str]:
-    return {"Authorization": f"Bearer {RUN_TOKEN}"}
-
-
-def _with_retries(action):
-    delay = 1.0
-    last_error: Exception | None = None
-    for attempt in range(8):
-        try:
-            return action()
-        except (httpx.TransportError, httpx.TimeoutException) as exc:
-            last_error = exc
-            if attempt == 7:
-                raise
-            time.sleep(delay)
-            delay = min(delay * 1.5, 8.0)
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError("retry loop exited unexpectedly")
+    return merge_runner_headers({"Authorization": f"Bearer {RUN_TOKEN}"})
 
 
 class StreamSplitter:
@@ -385,7 +371,7 @@ def run() -> int:
     checkout = resolve_workspace_root() / "repo"
     cache_dir = resolve_workspace_root() / "outbound"
     try:
-        with httpx.Client() as client:
+        with create_runner_client() as client:
             outbound = RunOutbound(
                 client,
                 api_base=API_BASE,
@@ -415,7 +401,7 @@ def run() -> int:
     except Exception as exc:
         print(f"Runner failed: {exc}", file=sys.stderr)
         try:
-            with httpx.Client() as client:
+            with create_runner_client() as client:
                 failed_outbound = RunOutbound(
                     client,
                     api_base=API_BASE,
@@ -476,21 +462,26 @@ def _execute(client: httpx.Client, outbound: RunOutbound, checkout: Path) -> int
     if interrupted is not None:
         return interrupted
 
-    config_response = client.get(
-        f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/effective-config",
-        headers=_headers(),
-        timeout=30.0,
-    )
-    config_response.raise_for_status()
-    _write_config_bytes(checkout, CONFIG_PATH, config_response.content)
+    def _fetch_config() -> bytes:
+        response = client.get(
+            f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/effective-config",
+            headers=_headers(),
+            timeout=60.0,
+        )
+        response.raise_for_status()
+        return response.content
 
-    env_response = client.get(
-        f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/effective-env",
-        headers=_headers(),
-        timeout=30.0,
-    )
-    env_response.raise_for_status()
-    _write_repo_dotenv(checkout, env_response.content)
+    def _fetch_env() -> bytes:
+        response = client.get(
+            f"{API_BASE}/api/v1/internal/runs/{RUN_ID}/effective-env",
+            headers=_headers(),
+            timeout=60.0,
+        )
+        response.raise_for_status()
+        return response.content
+
+    _write_config_bytes(checkout, CONFIG_PATH, with_transport_retries(_fetch_config))
+    _write_repo_dotenv(checkout, with_transport_retries(_fetch_env))
 
     interrupted = _handle_control(outbound, phase="training")
     if interrupted is not None:

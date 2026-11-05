@@ -9,6 +9,8 @@ from typing import Any
 
 import httpx
 
+from zust_runner.http_client import with_transport_retries
+
 _RETRIABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 
 
@@ -36,7 +38,9 @@ class RunOutbound:
         self._client = client
         self._api_base = api_base.rstrip("/")
         self._run_id = run_id
-        self._headers = headers
+        from zust_runner.http_client import merge_runner_headers
+
+        self._headers = merge_runner_headers(headers)
         self._cache_dir = cache_dir
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._queue_path = self._cache_dir / "pending.jsonl"
@@ -125,47 +129,59 @@ class RunOutbound:
             self._queue_path.unlink()
 
     def _send_progress(self, fields: dict[str, Any]) -> int:
-        response = self._client.post(
-            f"{self._api_base}/api/v1/internal/runs/{self._run_id}/progress",
-            headers=self._headers,
-            json=fields,
-            timeout=30.0,
-        )
-        response.raise_for_status()
-        data = response.json()
-        if bool(data.get("cancel")):
-            return 1
-        pending = data.get("pending_action")
-        if isinstance(pending, dict) and pending.get("type") == "purge_workspace":
-            return 3
-        remote_epoch = int(data.get("runner_epoch") or self._runner_epoch)
-        if remote_epoch > self._runner_epoch:
-            return 2
-        return 0
+        def _post() -> int:
+            response = self._client.post(
+                f"{self._api_base}/api/v1/internal/runs/{self._run_id}/progress",
+                headers=self._headers,
+                json=fields,
+                timeout=60.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+            if bool(data.get("cancel")):
+                return 1
+            pending = data.get("pending_action")
+            if isinstance(pending, dict) and pending.get("type") == "purge_workspace":
+                return 3
+            remote_epoch = int(data.get("runner_epoch") or self._runner_epoch)
+            if remote_epoch > self._runner_epoch:
+                return 2
+            return 0
+
+        return with_transport_retries(_post)
 
     def _send_logs(self, payload: dict[str, Any]) -> None:
-        self._client.post(
-            f"{self._api_base}/api/v1/internal/runs/{self._run_id}/logs",
-            headers=self._headers,
-            json=payload,
-            timeout=30.0,
-        ).raise_for_status()
+        def _post() -> None:
+            self._client.post(
+                f"{self._api_base}/api/v1/internal/runs/{self._run_id}/logs",
+                headers=self._headers,
+                json=payload,
+                timeout=60.0,
+            ).raise_for_status()
+
+        with_transport_retries(_post)
 
     def _send_metrics(self, payload: dict[str, Any]) -> None:
-        self._client.post(
-            f"{self._api_base}/api/v1/internal/runs/{self._run_id}/metrics",
-            headers=self._headers,
-            json=payload,
-            timeout=30.0,
-        ).raise_for_status()
+        def _post() -> None:
+            self._client.post(
+                f"{self._api_base}/api/v1/internal/runs/{self._run_id}/metrics",
+                headers=self._headers,
+                json=payload,
+                timeout=60.0,
+            ).raise_for_status()
+
+        with_transport_retries(_post)
 
     def _send_workspace_snapshot(self, payload: dict[str, Any]) -> None:
-        self._client.post(
-            f"{self._api_base}/api/v1/internal/runs/{self._run_id}/workspace-snapshot",
-            headers=self._headers,
-            json=payload,
-            timeout=60.0,
-        ).raise_for_status()
+        def _post() -> None:
+            self._client.post(
+                f"{self._api_base}/api/v1/internal/runs/{self._run_id}/workspace-snapshot",
+                headers=self._headers,
+                json=payload,
+                timeout=90.0,
+            ).raise_for_status()
+
+        with_transport_retries(_post)
 
     def _deliver(self, record: dict[str, Any]) -> None:
         kind = record.get("type")

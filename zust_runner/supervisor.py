@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 
 from zust_runner.huggingface_push import run_huggingface_push
+from zust_runner.http_client import create_runner_client, merge_runner_headers, with_transport_retries
 from zust_runner.main import PURGE_EXIT_CODE, RESTART_EXIT_CODE, resolve_workspace_root
 
 POLL_SECONDS = 3.0
@@ -20,7 +21,7 @@ POLL_SECONDS = 3.0
 
 def _headers() -> dict[str, str]:
     token = os.environ.get("ZUST_RUN_TOKEN", "")
-    return {"Authorization": f"Bearer {token}"}
+    return merge_runner_headers({"Authorization": f"Bearer {token}"})
 
 
 def _api_base() -> str:
@@ -32,21 +33,27 @@ def _run_id() -> str:
 
 
 def fetch_session(client: httpx.Client) -> dict[str, Any]:
-    response = client.get(
-        f"{_api_base()}/api/v1/internal/runs/{_run_id()}/session",
-        headers=_headers(),
-        timeout=30.0,
-    )
-    response.raise_for_status()
-    return response.json()
+    def _get() -> dict[str, Any]:
+        response = client.get(
+            f"{_api_base()}/api/v1/internal/runs/{_run_id()}/session",
+            headers=_headers(),
+            timeout=60.0,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    return with_transport_retries(_get)
 
 
 def complete_action(client: httpx.Client) -> None:
-    client.post(
-        f"{_api_base()}/api/v1/internal/runs/{_run_id()}/action-complete",
-        headers=_headers(),
-        timeout=30.0,
-    ).raise_for_status()
+    def _post() -> None:
+        client.post(
+            f"{_api_base()}/api/v1/internal/runs/{_run_id()}/action-complete",
+            headers=_headers(),
+            timeout=60.0,
+        ).raise_for_status()
+
+    with_transport_retries(_post)
 
 
 def purge_training_workspace() -> None:
@@ -151,7 +158,7 @@ def main() -> int:
 
     active_epoch = 0
     adopted_epoch = False
-    with httpx.Client() as client:
+    with create_runner_client() as client:
         while True:
             session = fetch_session(client)
             if session.get("cancel") or session.get("execution_status") == "CANCELLED":
