@@ -44,13 +44,27 @@ def resolve_training_log_dir(checkout: Path, config_rel: str) -> Path | None:
     return log_dir
 
 
-def _collect_points(log_dir: Path, sent_max_step: dict[str, int]) -> list[dict[str, Any]]:
+def _prune_event_file_state(sent_max_step: dict[str, dict[str, int]], active_files: set[str]) -> None:
+    for stale in [name for name in sent_max_step if name not in active_files]:
+        del sent_max_step[stale]
+
+
+def _collect_points(log_dir: Path, sent_max_step: dict[str, dict[str, int]]) -> list[dict[str, Any]]:
+    """Read new scalar points from TensorBoard event files.
+
+    Cursors are tracked per event file so a wiped log_dir (fresh steps from 1) still
+    uploads after an earlier partial run on the same workspace.
+    """
     if not log_dir.is_dir():
         return []
+    event_files = sorted(path for path in log_dir.glob("events.out.tfevents.*") if path.is_file())
+    active_names = {path.name for path in event_files}
+    _prune_event_file_state(sent_max_step, active_names)
+
     out: list[dict[str, Any]] = []
-    for event_file in sorted(log_dir.glob("events.out.tfevents.*")):
-        if not event_file.is_file():
-            continue
+    for event_file in event_files:
+        file_key = event_file.name
+        tag_state = sent_max_step.setdefault(file_key, {})
         try:
             accumulator = EventAccumulator(str(event_file))
             accumulator.Reload()
@@ -59,7 +73,7 @@ def _collect_points(log_dir: Path, sent_max_step: dict[str, int]) -> list[dict[s
         for tag in accumulator.Tags().get("scalars", []):
             if len(tag) > _MAX_TAG_LEN:
                 continue
-            last = sent_max_step.get(tag, -1)
+            last = tag_state.get(tag, -1)
             max_step = last
             for event in accumulator.Scalars(tag):
                 step = int(event.step)
@@ -74,7 +88,7 @@ def _collect_points(log_dir: Path, sent_max_step: dict[str, int]) -> list[dict[s
                 out.append(point)
                 max_step = max(max_step, step)
             if max_step > last:
-                sent_max_step[tag] = max_step
+                tag_state[tag] = max_step
     out.sort(key=lambda item: (item["tag"], item["step"]))
     return out
 
@@ -96,7 +110,7 @@ def tail_training_metrics(
     stop: threading.Event,
     post_metrics,
 ) -> None:
-    sent_max_step: dict[str, int] = {}
+    sent_max_step: dict[str, dict[str, int]] = {}
     while not stop.wait(_POLL_SECONDS):
         points = _collect_points(log_dir, sent_max_step)
         _append_metrics(points, post_metrics)
