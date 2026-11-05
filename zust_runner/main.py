@@ -50,6 +50,42 @@ def _skip_setup() -> bool:
     return os.environ.get("ZUST_SKIP_SETUP", "").strip() == "1"
 
 
+def _repo_has_pyproject(checkout: Path) -> bool:
+    return (checkout / "pyproject.toml").is_file()
+
+
+def _is_python_invocation(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    first = Path(argv[0]).name
+    if first in ("python", "python3") or first.startswith("python3."):
+        return True
+    if argv[0] == sys.executable:
+        return True
+    return first.endswith(".py")
+
+
+def normalize_uv_argv(argv: list[str], *, checkout: Path) -> list[str]:
+    """Run repo commands through uv when the project ships a pyproject.toml."""
+    if not argv or not _repo_has_pyproject(checkout):
+        return argv
+    if Path(argv[0]).name == "uv":
+        return argv
+    if _is_python_invocation(argv):
+        if Path(argv[0]).suffix == ".py":
+            return ["uv", "run", "python", *argv]
+        return ["uv", "run", *argv]
+    return argv
+
+
+def effective_setup_argv(checkout: Path) -> list[str]:
+    if SETUP_ARGV:
+        return list(SETUP_ARGV)
+    if _skip_setup() or not _repo_has_pyproject(checkout):
+        return []
+    return ["uv", "sync"]
+
+
 def _control_exit(control: int) -> int | None:
     if control == 2:
         return RESTART_EXIT_CODE
@@ -480,11 +516,12 @@ def _execute(client: httpx.Client, outbound: RunOutbound, checkout: Path) -> int
     except Exception:
         pass
 
-    if SETUP_ARGV and not _skip_setup():
+    setup_argv = effective_setup_argv(checkout)
+    if setup_argv and not _skip_setup():
         interrupted = _handle_control(outbound, phase="setup")
         if interrupted is not None:
             return interrupted
-        setup_code = _run_argv(outbound, SETUP_ARGV, checkout)
+        setup_code = _run_argv(outbound, setup_argv, checkout)
         if _stopped_for_control(setup_code):
             return setup_code
         if setup_code != 0:
@@ -520,9 +557,10 @@ def _execute(client: httpx.Client, outbound: RunOutbound, checkout: Path) -> int
     interrupted = _handle_control(outbound, phase="training")
     if interrupted is not None:
         return interrupted
+    training_argv = normalize_uv_argv(TRAINING_ARGV, checkout=checkout)
     training_code = run_training_with_metrics(
         client,
-        TRAINING_ARGV,
+        training_argv,
         checkout,
         CONFIG_PATH,
         run_argv=lambda _client, argv, cwd: _run_argv(outbound, argv, cwd),
@@ -546,7 +584,8 @@ def _execute(client: httpx.Client, outbound: RunOutbound, checkout: Path) -> int
         interrupted = _handle_control(outbound, phase="inference")
         if interrupted is not None:
             return interrupted
-        inference_code = _run_argv(outbound, INFERENCE_ARGV, checkout)
+        inference_argv = normalize_uv_argv(INFERENCE_ARGV, checkout=checkout)
+        inference_code = _run_argv(outbound, inference_argv, checkout)
         if _stopped_for_control(inference_code):
             return inference_code
         if inference_code != 0:

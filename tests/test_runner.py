@@ -13,6 +13,8 @@ from zust_runner.main import (
     _validate_repo_relative_path,
     _with_uv_skip_image_torch_packages,
     _write_repo_dotenv,
+    effective_setup_argv,
+    normalize_uv_argv,
     resolve_workspace_root,
 )
 
@@ -108,6 +110,33 @@ def test_image_torch_off_leaves_uv_commands_unchanged(monkeypatch, tmp_path):
     prelude, argv = _image_torch_steps(["uv", "sync"], tmp_path)
     assert prelude == []
     assert argv == ["uv", "sync"]
+
+
+def test_normalize_uv_argv_wraps_python_when_pyproject_exists(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = \"demo\"\n")
+    argv = ["python", "-u", "train.py", "--config", "config.yaml"]
+    assert normalize_uv_argv(argv, checkout=tmp_path) == [
+        "uv",
+        "run",
+        "python",
+        "-u",
+        "train.py",
+        "--config",
+        "config.yaml",
+    ]
+
+
+def test_normalize_uv_argv_leaves_uv_commands_unchanged(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = \"demo\"\n")
+    argv = ["uv", "run", "python", "train.py"]
+    assert normalize_uv_argv(argv, checkout=tmp_path) == argv
+
+
+def test_effective_setup_argv_defaults_to_uv_sync(tmp_path, monkeypatch):
+    monkeypatch.setenv("ZUST_SETUP_ARGV", "[]")
+    monkeypatch.delenv("ZUST_SKIP_SETUP", raising=False)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = \"demo\"\n")
+    assert effective_setup_argv(tmp_path) == ["uv", "sync"]
 
 
 def test_runner_rejects_traversal_path():
