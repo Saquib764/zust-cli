@@ -10,7 +10,7 @@ from typing import Any
 from zust_runner.main import resolve_workspace_root
 
 _MAX_ENTRIES = 8000
-_SKIP_DIR_NAMES = frozenset({"__pycache__", ".git"})
+_SKIP_DIR_NAMES = frozenset({"__pycache__", ".git", ".venv"})
 
 
 def repo_root() -> Path:
