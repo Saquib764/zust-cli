@@ -1,9 +1,7 @@
-"""Tail TensorBoard event files and POST scalar points to the Zust API."""
+"""Read TensorBoard event files for runner sync batches."""
 
 from __future__ import annotations
 
-import threading
-import time
 from pathlib import Path
 from typing import Any
 
@@ -11,8 +9,6 @@ import yaml
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 _MAX_TAG_LEN = 200
-_MAX_POINTS = 500
-_POLL_SECONDS = 3.0
 
 
 def resolve_training_log_dir(checkout: Path, config_rel: str) -> Path | None:
@@ -44,27 +40,23 @@ def resolve_training_log_dir(checkout: Path, config_rel: str) -> Path | None:
     return log_dir
 
 
-def _prune_event_file_state(sent_max_step: dict[str, dict[str, int]], active_files: set[str]) -> None:
-    for stale in [name for name in sent_max_step if name not in active_files]:
-        del sent_max_step[stale]
+def _prune_event_file_state(cursor: dict[str, dict[str, int]], active_files: set[str]) -> None:
+    for stale in [name for name in cursor if name not in active_files]:
+        del cursor[stale]
 
 
-def _collect_points(log_dir: Path, sent_max_step: dict[str, dict[str, int]]) -> list[dict[str, Any]]:
-    """Read new scalar points from TensorBoard event files.
-
-    Cursors are tracked per event file so a wiped log_dir (fresh steps from 1) still
-    uploads after an earlier partial run on the same workspace.
-    """
+def collect_new_scalars(log_dir: Path, cursor: dict[str, dict[str, int]]) -> list[dict[str, Any]]:
+    """Return scalar points newer than the persisted cursor (cursor is not mutated)."""
     if not log_dir.is_dir():
         return []
     event_files = sorted(path for path in log_dir.glob("events.out.tfevents.*") if path.is_file())
     active_names = {path.name for path in event_files}
-    _prune_event_file_state(sent_max_step, active_names)
+    _prune_event_file_state(cursor, active_names)
 
     out: list[dict[str, Any]] = []
     for event_file in event_files:
         file_key = event_file.name
-        tag_state = sent_max_step.setdefault(file_key, {})
+        tag_state = cursor.get(file_key, {})
         try:
             accumulator = EventAccumulator(str(event_file))
             accumulator.Reload()
@@ -74,7 +66,6 @@ def _collect_points(log_dir: Path, sent_max_step: dict[str, dict[str, int]]) -> 
             if len(tag) > _MAX_TAG_LEN:
                 continue
             last = tag_state.get(tag, -1)
-            max_step = last
             for event in accumulator.Scalars(tag):
                 step = int(event.step)
                 if step <= last:
@@ -82,68 +73,27 @@ def _collect_points(log_dir: Path, sent_max_step: dict[str, dict[str, int]]) -> 
                 value = float(event.value)
                 if value != value or value in (float("inf"), float("-inf")):
                     continue
-                point: dict[str, Any] = {"tag": tag, "step": step, "value": value}
+                point: dict[str, Any] = {
+                    "_event_file": file_key,
+                    "tag": tag,
+                    "step": step,
+                    "value": value,
+                }
                 if event.wall_time:
                     point["wall_time"] = float(event.wall_time)
                 out.append(point)
-                max_step = max(max_step, step)
-            if max_step > last:
-                tag_state[tag] = max_step
     out.sort(key=lambda item: (item["tag"], item["step"]))
     return out
 
 
-def _append_metrics(
-    points: list[dict[str, Any]],
-    post_metrics,
-) -> None:
-    if not points:
-        return
-    for start in range(0, len(points), _MAX_POINTS):
-        batch = points[start : start + _MAX_POINTS]
-        post_metrics(batch)
-
-
-def tail_training_metrics(
-    *,
-    log_dir: Path,
-    stop: threading.Event,
-    post_metrics,
-) -> None:
-    sent_max_step: dict[str, dict[str, int]] = {}
-    while not stop.wait(_POLL_SECONDS):
-        points = _collect_points(log_dir, sent_max_step)
-        _append_metrics(points, post_metrics)
-    points = _collect_points(log_dir, sent_max_step)
-    _append_metrics(points, post_metrics)
-
-
 def run_training_with_metrics(
-    client: httpx.Client,
+    client,
     argv: list[str],
     checkout: Path,
     config_rel: str,
     *,
     run_argv,
-    post_metrics,
+    coordinator=None,
 ) -> int:
-    log_dir = resolve_training_log_dir(checkout, config_rel)
-    stop = threading.Event()
-    tail_thread: threading.Thread | None = None
-    if log_dir is not None:
-        tail_thread = threading.Thread(
-            target=tail_training_metrics,
-            kwargs={
-                "log_dir": log_dir,
-                "stop": stop,
-                "post_metrics": post_metrics,
-            },
-            daemon=True,
-        )
-        tail_thread.start()
-    try:
-        return run_argv(client, argv, checkout)
-    finally:
-        if tail_thread is not None:
-            stop.set()
-            tail_thread.join(timeout=60)
+    del client, config_rel
+    return run_argv(None, argv, checkout)

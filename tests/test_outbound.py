@@ -8,15 +8,24 @@ import httpx
 from zust_runner.outbound import RunOutbound
 
 
-def test_queues_logs_on_503_then_flushes(tmp_path: Path) -> None:
+def test_queues_sync_on_503_then_flushes(tmp_path: Path) -> None:
     calls: list[tuple[str, str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/logs"):
-            calls.append(("logs", request.content.decode()))
+        if request.url.path.endswith("/sync"):
+            calls.append(("sync", request.content.decode()))
             if len(calls) == 1:
                 return httpx.Response(503)
-            return httpx.Response(200, json={"data": None})
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "cancel": False,
+                    "runner_generation": 1,
+                    "logs_accepted": 1,
+                    "metrics_accepted": 0,
+                },
+            )
         return httpx.Response(404)
 
     transport = httpx.MockTransport(handler)
@@ -32,7 +41,7 @@ def test_queues_logs_on_503_then_flushes(tmp_path: Path) -> None:
     outbound.append_log("stdout", "hello")
     assert outbound._queue_path.exists()
     queued = json.loads(outbound._queue_path.read_text().strip())
-    assert queued["type"] == "logs"
+    assert queued["type"] == "sync"
 
     outbound.flush()
     assert not outbound._queue_path.exists()
@@ -46,8 +55,10 @@ def test_progress_returns_purge_before_restart(tmp_path: Path) -> None:
             json={
                 "ok": True,
                 "cancel": False,
-                "runner_epoch": 4,
+                "runner_generation": 4,
                 "pending_action": {"type": "purge_workspace"},
+                "logs_accepted": 0,
+                "metrics_accepted": 0,
             },
         )
 
@@ -59,7 +70,7 @@ def test_progress_returns_purge_before_restart(tmp_path: Path) -> None:
         run_id="run_1",
         headers={"Authorization": "Bearer t"},
         cache_dir=tmp_path,
-        runner_epoch=1,
+        runner_generation=1,
     )
     assert outbound.post_progress(phase="training") == 3
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,7 @@ from typing import Any
 from zust_runner.http_client import create_runner_client, merge_runner_headers, with_transport_retries
 from zust_runner.metrics import run_training_with_metrics
 from zust_runner.outbound import RunOutbound
+from zust_runner.sync_coordinator import RunSyncCoordinator
 from zust_runner.runner_cache import EFFECTIVE_CONFIG_FILE, EFFECTIVE_ENV_FILE, fetch_cached_bytes, outbound_dir
 
 API_BASE = os.environ.get("ZUST_API_BASE", "").rstrip("/")
@@ -34,12 +36,13 @@ TRAINING_ARGV = json.loads(os.environ.get("ZUST_TRAINING_ARGV", "[]"))
 INFERENCE_ARGV = json.loads(os.environ.get("ZUST_INFERENCE_ARGV", "[]"))
 
 _LOG_LOCK = threading.Lock()
+_coordinator: RunSyncCoordinator | None = None
 RESTART_EXIT_CODE = 143
 PURGE_EXIT_CODE = 144
 
 
-def _runner_epoch() -> int:
-    return int(os.environ.get("ZUST_RUNNER_EPOCH", "1") or "1")
+def _runner_generation() -> int:
+    return int(os.environ.get("ZUST_RUNNER_GENERATION", "1") or "1")
 
 
 def _warm_restart() -> bool:
@@ -100,8 +103,27 @@ def _stopped_for_control(code: int) -> bool:
     return code in (RESTART_EXIT_CODE, PURGE_EXIT_CODE)
 
 
+_GITHUB_TOKEN_IN_URL = re.compile(r"x-access-token:[^@\s]+", re.IGNORECASE)
+
+
+def scrub_github_credentials(line: str) -> str:
+    return _GITHUB_TOKEN_IN_URL.sub("x-access-token:redacted", line)
+
+
+def _emit_log(outbound: RunOutbound, stream: str, line: str) -> None:
+    line = scrub_github_credentials(line)
+    if _coordinator is not None:
+        _coordinator.buffer_log(stream, line)
+        return
+    outbound.append_log(stream, line)
+
+
 def _handle_control(outbound: RunOutbound, **fields: Any) -> int | None:
-    exit_code = _control_exit(outbound.post_progress(**fields))
+    if _coordinator is not None:
+        control = _coordinator.sync_now(progress=fields or None, heartbeat=True)
+    else:
+        control = outbound.post_progress(**fields)
+    exit_code = _control_exit(control)
     if exit_code is None:
         return None
     if exit_code == 130:
@@ -246,13 +268,13 @@ def _drain(outbound: RunOutbound, stream: str, pipe) -> None:
             break
         for record in splitter.feed(decoder.decode(chunk)):
             with _LOG_LOCK:
-                outbound.append_log(stream, record)
+                _emit_log(outbound, stream, record)
     for record in splitter.feed(decoder.decode(b"", final=True)):
         with _LOG_LOCK:
-            outbound.append_log(stream, record)
+            _emit_log(outbound, stream, record)
     for record in splitter.finish():
         with _LOG_LOCK:
-            outbound.append_log(stream, record)
+            _emit_log(outbound, stream, record)
 
 
 def _use_image_torch() -> bool:
@@ -358,7 +380,13 @@ def _run_argv(outbound: RunOutbound, argv: list[str], cwd: Path) -> int:
     stdout_thread.start()
     stderr_thread.start()
     while process.poll() is None:
-        exit_code = _control_exit(outbound.post_progress())
+        control = outbound.consume_control()
+        if control == 0 and _coordinator is None:
+            control = outbound.post_progress()
+            time.sleep(1.0)
+        elif control == 0:
+            time.sleep(0.5)
+        exit_code = _control_exit(control)
         if exit_code is not None:
             process.terminate()
             try:
@@ -369,11 +397,32 @@ def _run_argv(outbound: RunOutbound, argv: list[str], cwd: Path) -> int:
             stdout_thread.join()
             stderr_thread.join()
             return exit_code
-        time.sleep(1.0)
     code = process.returncode if process.returncode is not None else process.wait()
     stdout_thread.join()
     stderr_thread.join()
     return code
+
+
+def _root_path() -> str:
+    path = os.environ.get("ZUST_ROOT_PATH", ".").strip().replace("\\", "/")
+    if path in ("", ".", "./"):
+        return "."
+    path = path.strip("/")
+    parts = [part for part in path.split("/") if part != "."]
+    if not parts or any(part in ("", "..") for part in parts):
+        raise ValueError("Root folder escapes repository")
+    return "/".join(parts)
+
+
+def _training_workdir(checkout: Path) -> Path:
+    """Directory inside the clone where config and training commands run."""
+    root = _root_path()
+    if root == ".":
+        return checkout
+    destination = _validate_repo_relative_path(checkout, root)
+    if not destination.is_dir():
+        raise ValueError(f"Root folder not found in repository: {root}")
+    return destination
 
 
 def _validate_repo_relative_path(checkout: Path, config_path: str) -> Path:
@@ -406,11 +455,25 @@ def _write_repo_dotenv(checkout: Path, content: bytes) -> None:
     _write_bytes_atomic(checkout / ".env", content)
 
 
+def _public_github_remote(owner: str, repo: str) -> str:
+    return f"https://github.com/{owner}/{repo}.git"
+
+
 def _github_remote_url(owner: str, repo: str) -> str:
     token = os.environ.get("ZUST_GITHUB_TOKEN", "").strip()
     if token:
         return f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
-    return f"https://github.com/{owner}/{repo}.git"
+    return _public_github_remote(owner, repo)
+
+
+def _clear_origin_credentials(checkout: Path, outbound: RunOutbound, owner: str, repo: str) -> None:
+    if not (checkout / ".git").is_dir():
+        return
+    _run_argv(
+        outbound,
+        ["git", "remote", "set-url", "origin", _public_github_remote(owner, repo)],
+        checkout,
+    )
 
 
 def _maybe_clean_tensorboard(outbound: RunOutbound, checkout: Path) -> None:
@@ -419,7 +482,8 @@ def _maybe_clean_tensorboard(outbound: RunOutbound, checkout: Path) -> None:
     from zust_runner.tensorboard_clean import clean_tensorboard_events
 
     removed = clean_tensorboard_events(checkout, CONFIG_PATH)
-    outbound.append_log(
+    _emit_log(
+        outbound,
         "stdout",
         f"Cleared {removed} TensorBoard event file(s) before training restart.",
     )
@@ -427,15 +491,17 @@ def _maybe_clean_tensorboard(outbound: RunOutbound, checkout: Path) -> None:
 
 
 def _clone_commit(checkout: Path, outbound: RunOutbound) -> None:
-    if _warm_restart() and (checkout / ".git").is_dir():
-        return
     owner, repo = REPOSITORY.split("/", 1)
+    if _warm_restart() and (checkout / ".git").is_dir():
+        _clear_origin_credentials(checkout, outbound, owner, repo)
+        return
     remote = _github_remote_url(owner, repo)
     checkout.mkdir(parents=True, exist_ok=True)
     _run_argv(outbound, ["git", "init", "-b", GIT_BRANCH], checkout)
     _run_argv(outbound, ["git", "remote", "add", "origin", remote], checkout)
     _run_argv(outbound, ["git", "fetch", "--depth", "1", "origin", COMMIT_SHA], checkout)
     _run_argv(outbound, ["git", "checkout", "--detach", "FETCH_HEAD"], checkout)
+    _clear_origin_credentials(checkout, outbound, owner, repo)
 
 
 def run() -> int:
@@ -453,25 +519,24 @@ def run() -> int:
                 run_id=RUN_ID,
                 headers=_headers(),
                 cache_dir=cache_dir,
-                runner_epoch=_runner_epoch(),
+                runner_generation=_runner_generation(),
             )
-            stop_heartbeat = threading.Event()
+            global _coordinator
+            from zust_runner.workspace_snapshot import workspace_snapshot_payload
 
-            def _heartbeat() -> None:
-                from zust_runner.workspace_snapshot import workspace_snapshot_payload
-
-                while not stop_heartbeat.wait(30):
-                    outbound.post_progress()
-                    try:
-                        outbound.post_workspace_snapshot(workspace_snapshot_payload())
-                    except Exception:
-                        pass
-
-            threading.Thread(target=_heartbeat, daemon=True).start()
+            _coordinator = RunSyncCoordinator(
+                outbound,
+                cache_dir=cache_dir,
+                checkout=checkout,
+                config_rel=CONFIG_PATH,
+                workspace_payload=workspace_snapshot_payload,
+            )
+            _coordinator.start()
             try:
                 return _execute(client, outbound, checkout)
             finally:
-                stop_heartbeat.set()
+                _coordinator.stop()
+                _coordinator = None
                 outbound.flush()
     except Exception as exc:
         print(f"Runner failed: {exc}", file=sys.stderr)
@@ -483,7 +548,7 @@ def run() -> int:
                     run_id=RUN_ID,
                     headers=_headers(),
                     cache_dir=cache_dir,
-                    runner_epoch=_runner_epoch(),
+                    runner_generation=_runner_generation(),
                 )
                 failed_outbound.post_progress(
                     execution_status="FAILED",
@@ -508,20 +573,17 @@ def _execute(client: httpx.Client, outbound: RunOutbound, checkout: Path) -> int
         return interrupted
 
     _clone_commit(checkout, outbound)
-    _maybe_clean_tensorboard(outbound, checkout)
-    try:
-        from zust_runner.workspace_snapshot import workspace_snapshot_payload
+    workdir = _training_workdir(checkout)
+    _maybe_clean_tensorboard(outbound, workdir)
+    if _coordinator is not None:
+        _coordinator.sync_now(heartbeat=True, include_workspace=True)
 
-        outbound.post_workspace_snapshot(workspace_snapshot_payload())
-    except Exception:
-        pass
-
-    setup_argv = effective_setup_argv(checkout)
+    setup_argv = effective_setup_argv(workdir)
     if setup_argv and not _skip_setup():
         interrupted = _handle_control(outbound, phase="setup")
         if interrupted is not None:
             return interrupted
-        setup_code = _run_argv(outbound, setup_argv, checkout)
+        setup_code = _run_argv(outbound, setup_argv, workdir)
         if _stopped_for_control(setup_code):
             return setup_code
         if setup_code != 0:
@@ -551,23 +613,37 @@ def _execute(client: httpx.Client, outbound: RunOutbound, checkout: Path) -> int
         headers=_headers(),
         cache_path=cache_root / EFFECTIVE_ENV_FILE,
     )
-    _write_config_bytes(checkout, CONFIG_PATH, config_bytes)
-    _write_repo_dotenv(checkout, env_bytes)
+    _write_config_bytes(workdir, CONFIG_PATH, config_bytes)
+    _write_repo_dotenv(workdir, env_bytes)
+    if _coordinator is not None:
+        _coordinator.bind_project_dir(workdir)
 
     interrupted = _handle_control(outbound, phase="training")
     if interrupted is not None:
         return interrupted
-    training_argv = normalize_uv_argv(TRAINING_ARGV, checkout=checkout)
+    if workdir != checkout:
+        _emit_log(outbound, "stdout", f"Working directory: {_root_path()}")
+    training_argv = normalize_uv_argv(TRAINING_ARGV, checkout=workdir)
     training_code = run_training_with_metrics(
         client,
         training_argv,
-        checkout,
+        workdir,
         CONFIG_PATH,
         run_argv=lambda _client, argv, cwd: _run_argv(outbound, argv, cwd),
-        post_metrics=outbound.post_metrics,
+        coordinator=_coordinator,
     )
     if _stopped_for_control(training_code):
         return training_code
+    if _coordinator is not None and not _coordinator.flush_metrics_barrier():
+        failed_stage = "metrics_flush"
+        outbound.post_progress(
+            execution_status="FAILED",
+            phase="finished",
+            failed_stage=failed_stage,
+            setup_exit_code=setup_code,
+            training_exit_code=training_code,
+        )
+        return 1
     if training_code != 0:
         failed_stage = "training"
         outbound.post_progress(
@@ -584,8 +660,8 @@ def _execute(client: httpx.Client, outbound: RunOutbound, checkout: Path) -> int
         interrupted = _handle_control(outbound, phase="inference")
         if interrupted is not None:
             return interrupted
-        inference_argv = normalize_uv_argv(INFERENCE_ARGV, checkout=checkout)
-        inference_code = _run_argv(outbound, inference_argv, checkout)
+        inference_argv = normalize_uv_argv(INFERENCE_ARGV, checkout=workdir)
+        inference_code = _run_argv(outbound, inference_argv, workdir)
         if _stopped_for_control(inference_code):
             return inference_code
         if inference_code != 0:

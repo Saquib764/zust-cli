@@ -119,10 +119,10 @@ def _run_pending_action(client: httpx.Client, session: dict[str, Any]) -> None:
     complete_action(client, ack_action=action)
 
 
-def _child_env(session: dict[str, Any], epoch: int) -> dict[str, str]:
+def _child_env(session: dict[str, Any], generation: int) -> dict[str, str]:
     env = os.environ.copy()
-    env["ZUST_RUNNER_EPOCH"] = str(epoch)
-    if epoch > 1:
+    env["ZUST_RUNNER_GENERATION"] = str(generation)
+    if generation > 1:
         env["ZUST_WARM_RESTART"] = "1"
     if session.get("skip_setup"):
         env["ZUST_SKIP_SETUP"] = "1"
@@ -135,8 +135,8 @@ def _child_env(session: dict[str, Any], epoch: int) -> dict[str, str]:
     return env
 
 
-def _run_training_once(session: dict[str, Any], epoch: int) -> int:
-    env = _child_env(session, epoch)
+def _run_training_once(session: dict[str, Any], generation: int) -> int:
+    env = _child_env(session, generation)
     completed = subprocess.run(
         [sys.executable, "-m", "zust_runner"],
         env=env,
@@ -158,7 +158,7 @@ def _post_idle_workspace_snapshot(client: httpx.Client) -> None:
         cache_dir=cache_dir,
     )
     try:
-        outbound.post_workspace_snapshot(workspace_snapshot_payload())
+        outbound.post_sync({"heartbeat": False, "workspace": workspace_snapshot_payload()})
     except Exception:
         pass
 
@@ -171,7 +171,7 @@ def _session_cancelled(session: dict[str, Any]) -> bool:
     return bool(session.get("run_cancelled")) or str(session.get("execution_status") or "") == "CANCELLED"
 
 
-def _wait_for_work(client: httpx.Client, *, after_epoch: int) -> dict[str, Any]:
+def _wait_for_work(client: httpx.Client, *, after_generation: int) -> dict[str, Any]:
     last_snapshot = 0.0
     while True:
         poll = fetch_session(client)
@@ -191,8 +191,8 @@ def _wait_for_work(client: httpx.Client, *, after_epoch: int) -> dict[str, Any]:
             continue
         if _session_cancelled(session):
             return session
-        epoch = int(session.get("runner_epoch") or 1)
-        if epoch > after_epoch:
+        generation = int(session.get("runner_generation") or 1)
+        if generation > after_generation:
             return session
         if session.get("pending_action"):
             return session
@@ -215,8 +215,8 @@ def main() -> int:
         print("Missing ZUST_API_BASE, ZUST_RUN_ID, or ZUST_RUN_TOKEN", file=sys.stderr)
         return 2
 
-    active_epoch = 0
-    adopted_epoch = False
+    active_generation = 0
+    adopted_generation = False
     with create_runner_client() as client:
         while True:
             poll = fetch_session(client)
@@ -227,22 +227,22 @@ def main() -> int:
             if poll.live and _session_cancelled(session):
                 return 0
 
-            target_epoch = int(session.get("runner_epoch") or 1)
-            epoch_changed = adopted_epoch and target_epoch != active_epoch
-            adopted_epoch = True
-            active_epoch = target_epoch
+            target_generation = int(session.get("runner_generation") or 1)
+            generation_changed = adopted_generation and target_generation != active_generation
+            adopted_generation = True
+            active_generation = target_generation
 
             if poll.live and _pending_type(session) is not None:
                 _run_pending_action(client, session)
-                if _pending_type(session) == "purge_workspace" and not epoch_changed:
-                    _wait_for_work(client, after_epoch=active_epoch)
+                if _pending_type(session) == "purge_workspace" and not generation_changed:
+                    _wait_for_work(client, after_generation=active_generation)
                     continue
                 poll = fetch_session(client)
                 session = _require_session(poll)
                 if session is None:
                     continue
 
-            code = _run_training_once(session, active_epoch)
+            code = _run_training_once(session, active_generation)
             if code == RESTART_EXIT_CODE:
                 continue
             if code == PURGE_EXIT_CODE:
@@ -258,31 +258,31 @@ def main() -> int:
                         continue
                 if poll.live and _session_cancelled(session):
                     return 0
-                if poll.live and int(session.get("runner_epoch") or 1) > active_epoch:
+                if poll.live and int(session.get("runner_generation") or 1) > active_generation:
                     continue
-                _wait_for_work(client, after_epoch=active_epoch)
+                _wait_for_work(client, after_generation=active_generation)
                 continue
             if code != 0:
                 poll = fetch_session(client)
                 session = _require_session(poll)
                 if session is None:
-                    _wait_for_work(client, after_epoch=active_epoch)
+                    _wait_for_work(client, after_generation=active_generation)
                     continue
-                if poll.live and int(session.get("runner_epoch") or 1) > active_epoch:
+                if poll.live and int(session.get("runner_generation") or 1) > active_generation:
                     continue
                 if poll.live and session.get("turn_off_when_finished"):
                     return code
-                _wait_for_work(client, after_epoch=active_epoch)
+                _wait_for_work(client, after_generation=active_generation)
                 continue
 
             poll = fetch_session(client)
             if poll.source == "unavailable" or poll.body is None:
-                _wait_for_work(client, after_epoch=active_epoch)
+                _wait_for_work(client, after_generation=active_generation)
                 continue
             session = poll.body
             if poll.live and session.get("turn_off_when_finished"):
                 return 0
-            _wait_for_work(client, after_epoch=active_epoch)
+            _wait_for_work(client, after_generation=active_generation)
 
 
 if __name__ == "__main__":

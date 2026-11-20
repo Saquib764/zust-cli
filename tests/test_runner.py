@@ -8,7 +8,10 @@ import pytest
 
 from zust_runner.main import (
     StreamSplitter,
+    _clone_commit,
     _github_remote_url,
+    _training_workdir,
+    scrub_github_credentials,
     _image_torch_steps,
     _validate_repo_relative_path,
     _with_uv_skip_image_torch_packages,
@@ -31,9 +34,58 @@ def test_github_remote_url_uses_token_when_set(monkeypatch):
     assert url == "https://x-access-token:gh_secret@github.com/acme/models.git"
 
 
+def test_training_workdir_defaults_to_checkout(monkeypatch, tmp_path):
+    monkeypatch.delenv("ZUST_ROOT_PATH", raising=False)
+    checkout = tmp_path / "repo"
+    checkout.mkdir()
+    assert _training_workdir(checkout) == checkout
+
+
+def test_training_workdir_uses_repo_subfolder(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZUST_ROOT_PATH", "train")
+    checkout = tmp_path / "repo"
+    workdir = checkout / "train"
+    workdir.mkdir(parents=True)
+    assert _training_workdir(checkout) == workdir
+
+
+def test_training_workdir_rejects_missing_folder(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZUST_ROOT_PATH", "missing")
+    checkout = tmp_path / "repo"
+    checkout.mkdir()
+    with pytest.raises(ValueError, match="Root folder not found"):
+        _training_workdir(checkout)
+
+
 def test_github_remote_url_is_anonymous_without_token(monkeypatch):
     monkeypatch.delenv("ZUST_GITHUB_TOKEN", raising=False)
     assert _github_remote_url("acme", "models") == "https://github.com/acme/models.git"
+
+
+def test_scrub_github_credentials_redacts_remote_token():
+    line = "fatal: https://x-access-token:gh_secret@github.com/acme/models.git not found"
+    assert "gh_secret" not in scrub_github_credentials(line)
+    assert "x-access-token:redacted@" in scrub_github_credentials(line)
+
+
+def test_clone_commit_removes_token_from_origin(monkeypatch, tmp_path):
+    calls: list[list[str]] = []
+    monkeypatch.setattr("zust_runner.main.REPOSITORY", "acme/models")
+    monkeypatch.setattr("zust_runner.main.GIT_BRANCH", "main")
+    monkeypatch.setattr("zust_runner.main.COMMIT_SHA", "abc")
+    monkeypatch.setenv("ZUST_GITHUB_TOKEN", "gh_secret")
+    monkeypatch.delenv("ZUST_WARM_RESTART", raising=False)
+
+    def record(_outbound, argv, cwd):
+        calls.append(argv)
+        if argv[:2] == ["git", "init"]:
+            (cwd / ".git").mkdir()
+        return 0
+
+    monkeypatch.setattr("zust_runner.main._run_argv", record)
+    _clone_commit(tmp_path, outbound=None)
+    assert calls[-1] == ["git", "remote", "set-url", "origin", "https://github.com/acme/models.git"]
+    assert any("x-access-token:gh_secret@" in part for argv in calls for part in argv)
 
 
 def test_workspace_root_defaults_to_pod_volume(monkeypatch):

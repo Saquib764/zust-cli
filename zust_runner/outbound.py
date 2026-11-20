@@ -27,7 +27,7 @@ class RunOutbound:
         run_id: str,
         headers: dict[str, str],
         cache_dir: Path,
-        runner_epoch: int = 1,
+        runner_generation: int = 1,
     ) -> None:
         self._client = client
         self._api_base = api_base.rstrip("/")
@@ -39,8 +39,18 @@ class RunOutbound:
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._queue_path = self._cache_dir / "pending.jsonl"
         self._lock = threading.Lock()
-        self._runner_epoch = runner_epoch
+        self._runner_generation = runner_generation
         self._last_run_cancelled = False
+        self._metrics_pending_path = self._cache_dir / "metrics-pending.jsonl"
+        self._pending_control = 0
+
+    def note_control(self, code: int) -> None:
+        if code:
+            self._pending_control = code
+
+    def consume_control(self) -> int:
+        code, self._pending_control = self._pending_control, 0
+        return code
 
     def flush(self) -> None:
         with self._lock:
@@ -60,29 +70,28 @@ class RunOutbound:
                         break
             self._write_queue(remaining)
 
-    def post_progress(self, **fields: Any) -> int:
-        """Return 0 continue, 1 cancel, 2 warm restart, 3 purge workspace."""
+    def post_sync(self, payload: dict[str, Any]) -> tuple[int, int]:
+        """Return (control_code, metrics_accepted)."""
         self.flush()
         try:
-            return self._send_progress(fields)
+            return self._send_sync(payload)
         except Exception as exc:
             if _is_retriable(exc):
-                self._enqueue({"type": "progress", "payload": fields})
-                return 0
+                self._enqueue({"type": "sync", "payload": payload})
+                return 0, 0
             raise
+
+    def post_progress(self, **fields: Any) -> int:
+        """Return 0 continue, 1 cancel, 2 warm restart, 3 purge workspace."""
+        control, _ = self.post_sync({"heartbeat": True, "progress": fields})
+        return control
 
     def append_logs(self, entries: list[dict[str, str]]) -> None:
         if not entries:
             return
-        self.flush()
-        payload = {"entries": entries}
-        try:
-            self._send_logs(payload)
-        except Exception as exc:
-            if _is_retriable(exc):
-                self._enqueue({"type": "logs", "payload": payload})
-                return
-            raise
+        control, _ = self.post_sync({"heartbeat": False, "log_entries": entries})
+        if control:
+            return
 
     def append_log(self, stream: str, line: str) -> None:
         self.append_logs([{"stream": stream, "line": line}])
@@ -90,27 +99,14 @@ class RunOutbound:
     def post_workspace_snapshot(self, payload: dict[str, Any]) -> None:
         if not payload.get("entries"):
             return
-        self.flush()
-        try:
-            self._send_workspace_snapshot(payload)
-        except Exception as exc:
-            if _is_retriable(exc):
-                self._enqueue({"type": "workspace", "payload": payload})
-                return
-            raise
+        self.post_sync({"heartbeat": False, "workspace": payload})
 
     def post_metrics(self, points: list[dict[str, Any]]) -> None:
         if not points:
             return
-        self.flush()
-        payload = {"points": points}
-        try:
-            self._send_metrics(payload)
-        except Exception as exc:
-            if _is_retriable(exc):
-                self._enqueue({"type": "metrics", "payload": payload})
-                return
-            raise
+        _, accepted = self.post_sync({"heartbeat": False, "metric_points": points})
+        if accepted != len(points):
+            self._enqueue_metrics(points[accepted:])
 
     def _enqueue(self, record: dict[str, Any]) -> None:
         with self._lock:
@@ -123,6 +119,42 @@ class RunOutbound:
         elif self._queue_path.exists():
             self._queue_path.unlink()
 
+    def _enqueue_metrics(self, points: list[dict[str, Any]]) -> None:
+        if not points:
+            return
+        with self._lock:
+            with self._metrics_pending_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"points": points}, separators=(",", ":")) + "\n")
+
+    def _send_sync(self, payload: dict[str, Any]) -> tuple[int, int]:
+        def _post() -> tuple[int, int]:
+            response = self._client.post(
+                f"{self._api_base}/api/v1/internal/runs/{self._run_id}/sync",
+                headers=self._headers,
+                json=payload,
+                timeout=90.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+            control = self._control_from_response(data)
+            self.note_control(control)
+            metrics_accepted = int(data.get("metrics_accepted") or 0)
+            return control, metrics_accepted
+
+        return with_transport_retries(_post)
+
+    def _control_from_response(self, data: dict[str, Any]) -> int:
+        if bool(data.get("cancel")):
+            self._last_run_cancelled = bool(data.get("run_cancelled"))
+            return 1
+        pending = data.get("pending_action")
+        if isinstance(pending, dict) and pending.get("type") == "purge_workspace":
+            return 3
+        remote_generation = int(data.get("runner_generation") or self._runner_generation)
+        if remote_generation > self._runner_generation:
+            return 2
+        return 0
+
     def _send_progress(self, fields: dict[str, Any]) -> int:
         def _post() -> int:
             response = self._client.post(
@@ -133,16 +165,7 @@ class RunOutbound:
             )
             response.raise_for_status()
             data = response.json()
-            if bool(data.get("cancel")):
-                self._last_run_cancelled = bool(data.get("run_cancelled"))
-                return 1
-            pending = data.get("pending_action")
-            if isinstance(pending, dict) and pending.get("type") == "purge_workspace":
-                return 3
-            remote_epoch = int(data.get("runner_epoch") or self._runner_epoch)
-            if remote_epoch > self._runner_epoch:
-                return 2
-            return 0
+            return self._control_from_response(data)
 
         return with_transport_retries(_post)
 
@@ -182,7 +205,9 @@ class RunOutbound:
     def _deliver(self, record: dict[str, Any]) -> None:
         kind = record.get("type")
         payload = record.get("payload") or {}
-        if kind == "progress":
+        if kind == "sync":
+            self._send_sync(payload)
+        elif kind == "progress":
             self._send_progress(payload)
         elif kind == "logs":
             self._send_logs(payload)

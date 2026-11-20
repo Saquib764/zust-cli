@@ -26,7 +26,7 @@ def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def test_fetch_session_returns_cache_on_502(workspace: Path) -> None:
-    save_session({"runner_epoch": 2, "cancel": False, "execution_status": "RUNNING"})
+    save_session({"runner_generation": 2, "cancel": False, "execution_status": "RUNNING"})
 
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(502)
@@ -40,11 +40,11 @@ def test_fetch_session_returns_cache_on_502(workspace: Path) -> None:
     )
     assert poll.source == "cache"
     assert poll.body is not None
-    assert poll.body["runner_epoch"] == 2
+    assert poll.body["runner_generation"] == 2
 
 
 def test_fetch_session_saves_live_response(workspace: Path) -> None:
-    payload = {"runner_epoch": 3, "cancel": False, "execution_status": "RUNNING"}
+    payload = {"runner_generation": 3, "cancel": False, "execution_status": "RUNNING"}
 
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=payload)
