@@ -8,18 +8,19 @@ from typing import Any
 import yaml
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
+from zust_runner.config_paths import _path_within_any_anchor, find_config_file
+
 _MAX_TAG_LEN = 200
 
 
-def resolve_training_log_dir(checkout: Path, config_rel: str) -> Path | None:
-    normalized = config_rel.replace("\\", "/").lstrip("/")
-    if ".." in normalized.split("/"):
-        return None
-    config_file = (checkout / normalized).resolve()
-    checkout_resolved = checkout.resolve()
-    if config_file != checkout_resolved and checkout_resolved not in config_file.parents:
-        return None
-    if not config_file.is_file():
+def resolve_training_log_dir(
+    project_root: Path,
+    config_rel: str,
+    *,
+    repo_root: Path | None = None,
+) -> Path | None:
+    config_file = find_config_file(project_root, config_rel, repo_root=repo_root)
+    if config_file is None:
         return None
     raw = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
@@ -35,7 +36,10 @@ def resolve_training_log_dir(checkout: Path, config_rel: str) -> Path | None:
         log_dir = (config_file.parent / log_dir).resolve()
     else:
         log_dir = log_dir.resolve()
-    if log_dir != checkout_resolved and checkout_resolved not in log_dir.parents:
+    anchors = [project_root.resolve()]
+    if repo_root is not None:
+        anchors.append(repo_root.resolve())
+    if not _path_within_any_anchor(log_dir, anchors):
         return None
     return log_dir
 

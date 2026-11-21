@@ -4,23 +4,74 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from huggingface_hub import HfApi, create_repo
 
+_TOKEN_KEYS = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN")
 
-def _token() -> str:
-    for key in ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
-        value = os.environ.get(key, "").strip()
+
+def _parse_env_text(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if key:
+            values[key] = value
+    return values
+
+
+def _token_from_mapping(values: dict[str, str]) -> str:
+    for key in _TOKEN_KEYS:
+        value = values.get(key, "").strip()
         if value:
             return value
+    return ""
+
+
+def _env_file_candidates(checkout: Path) -> list[Path]:
+    from zust_runner.runner_cache import EFFECTIVE_ENV_FILE, outbound_dir
+
+    candidates = [outbound_dir() / EFFECTIVE_ENV_FILE, checkout / ".env"]
+    root = os.environ.get("ZUST_ROOT_PATH", "").strip().replace("\\", "/").strip("/")
+    if root and root not in {".", "./"}:
+        candidates.append(checkout / root / ".env")
+    return candidates
+
+
+def _token(checkout: Path) -> str:
+    found = _token_from_mapping({key: os.environ.get(key, "") for key in _TOKEN_KEYS})
+    if found:
+        return found
+    for path in _env_file_candidates(checkout):
+        if not path.is_file():
+            continue
+        found = _token_from_mapping(_parse_env_text(path.read_text(encoding="utf-8", errors="replace")))
+        if found:
+            return found
     raise RuntimeError(
         "Hugging Face token missing. Add HF_TOKEN to run env_content or the pod environment."
     )
 
 
-def run_huggingface_push(action: dict[str, Any], checkout: Path) -> None:
+def run_huggingface_push(
+    action: dict[str, Any],
+    checkout: Path,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> None:
     folder_path = str(action.get("folder_path") or "").strip().replace("\\", "/").lstrip("/")
     repo_id = str(action.get("repo_id") or "").strip()
     if not folder_path or not repo_id:
@@ -35,8 +86,15 @@ def run_huggingface_push(action: dict[str, Any], checkout: Path) -> None:
     if not source.is_dir():
         raise FileNotFoundError(f"Folder not found: {folder_path}")
 
-    token = _token()
+    token = _token(checkout)
     api = HfApi(token=token)
+
+    def emit(message: str) -> None:
+        if log is not None:
+            log(message)
+        else:
+            print(message, flush=True)
+
     if action.get("create_repo"):
         create_repo(
             repo_id,
@@ -45,14 +103,14 @@ def run_huggingface_push(action: dict[str, Any], checkout: Path) -> None:
             exist_ok=True,
         )
 
-    print(f"Uploading {source} to huggingface.co/{repo_id} ...", flush=True)
+    emit(f"Uploading {folder_path} to huggingface.co/{repo_id} ...")
     api.upload_folder(
         repo_id=repo_id,
         folder_path=str(source),
         repo_type="model",
         commit_message="Upload from Zust training run",
     )
-    print(f"Uploaded to https://huggingface.co/{repo_id}", flush=True)
+    emit(f"Uploaded {folder_path} to https://huggingface.co/{repo_id}")
 
 
 def main() -> int:

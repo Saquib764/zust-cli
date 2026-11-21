@@ -6,8 +6,37 @@ from unittest.mock import patch
 
 import yaml
 
+from zust_runner.config_paths import find_config_file, normalize_config_rel
 from zust_runner.metrics import collect_new_scalars, resolve_training_log_dir
 from zust_runner.metrics_cursor import apply_ack
+
+
+def test_normalize_config_rel_strips_root_prefix() -> None:
+    assert normalize_config_rel("probe-pulse/config.yaml", "probe-pulse") == "config.yaml"
+    assert normalize_config_rel("config.yaml", "probe-pulse") == "config.yaml"
+
+
+def test_resolve_training_log_dir_repo_relative_config_in_subfolder(tmp_path: Path) -> None:
+    checkout = tmp_path / "repo"
+    workdir = checkout / "probe-pulse"
+    workdir.mkdir(parents=True)
+    config = workdir / "config.yaml"
+    config.write_text(yaml.dump({"train": {"log_dir": "training_session/tb"}}), encoding="utf-8")
+    resolved = resolve_training_log_dir(
+        workdir,
+        "probe-pulse/config.yaml",
+        repo_root=checkout,
+    )
+    assert resolved == (workdir / "training_session/tb").resolve()
+
+
+def test_find_config_file_uses_repo_root_fallback(tmp_path: Path) -> None:
+    checkout = tmp_path / "repo"
+    workdir = checkout / "probe-pulse"
+    workdir.mkdir(parents=True)
+    config = workdir / "config.yaml"
+    config.write_text("train: {}\n", encoding="utf-8")
+    assert find_config_file(workdir, "probe-pulse/config.yaml", repo_root=checkout) == config
 
 
 def test_resolve_training_log_dir_relative(tmp_path: Path) -> None:

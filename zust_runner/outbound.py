@@ -43,6 +43,8 @@ class RunOutbound:
         self._last_run_cancelled = False
         self._metrics_pending_path = self._cache_dir / "metrics-pending.jsonl"
         self._pending_control = 0
+        self._hf_action_lock = threading.Lock()
+        self._huggingface_action: dict[str, Any] | None = None
 
     def note_control(self, code: int) -> None:
         if code:
@@ -51,6 +53,27 @@ class RunOutbound:
     def consume_control(self) -> int:
         code, self._pending_control = self._pending_control, 0
         return code
+
+    def peek_huggingface_action(self) -> dict[str, Any] | None:
+        with self._hf_action_lock:
+            action = self._huggingface_action
+            return dict(action) if isinstance(action, dict) else None
+
+    def complete_runner_action(self, action: dict[str, Any]) -> None:
+        from zust_runner.runner_cache import complete_action_resilient
+
+        complete_action_resilient(
+            self._client,
+            api_base=self._api_base,
+            run_id=self._run_id,
+            headers=self._headers,
+            ack_action=action,
+        )
+
+    def _remember_huggingface_action(self, pending: Any) -> None:
+        action = pending if isinstance(pending, dict) and pending.get("type") == "huggingface_push" else None
+        with self._hf_action_lock:
+            self._huggingface_action = dict(action) if isinstance(action, dict) else None
 
     def flush(self) -> None:
         with self._lock:
@@ -144,10 +167,11 @@ class RunOutbound:
         return with_transport_retries(_post)
 
     def _control_from_response(self, data: dict[str, Any]) -> int:
+        pending = data.get("pending_action")
+        self._remember_huggingface_action(pending)
         if bool(data.get("cancel")):
             self._last_run_cancelled = bool(data.get("run_cancelled"))
             return 1
-        pending = data.get("pending_action")
         if isinstance(pending, dict) and pending.get("type") == "purge_workspace":
             return 3
         remote_generation = int(data.get("runner_generation") or self._runner_generation)

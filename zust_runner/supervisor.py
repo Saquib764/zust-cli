@@ -81,6 +81,23 @@ def purge_training_workspace() -> None:
             shutil.rmtree(target, ignore_errors=True)
 
 
+def _emit_runner_log(client: httpx.Client, stream: str, line: str) -> None:
+    print(line, file=sys.stderr if stream == "stderr" else sys.stdout, flush=True)
+    try:
+        from zust_runner.outbound import RunOutbound
+
+        outbound = RunOutbound(
+            client,
+            api_base=_api_base(),
+            run_id=_run_id(),
+            headers=_headers(),
+            cache_dir=resolve_workspace_root() / "outbound",
+        )
+        outbound.append_log(stream, line)
+    except Exception:
+        pass
+
+
 def _pending_type(session: dict[str, Any]) -> str | None:
     action = session.get("pending_action")
     if isinstance(action, dict) and isinstance(action.get("type"), str):
@@ -115,7 +132,14 @@ def _run_pending_action(client: httpx.Client, session: dict[str, Any]) -> None:
         complete_action(client, ack_action=action)
         return
     checkout = resolve_workspace_root() / "repo"
-    run_huggingface_push(action, checkout)
+    try:
+        run_huggingface_push(
+            action,
+            checkout,
+            log=lambda line: _emit_runner_log(client, "stdout", line),
+        )
+    except Exception as exc:
+        _emit_runner_log(client, "stderr", f"Hugging Face upload failed: {exc}")
     complete_action(client, ack_action=action)
 
 

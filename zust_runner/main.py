@@ -18,6 +18,7 @@ import httpx
 from typing import Any
 
 from zust_runner.http_client import create_runner_client, merge_runner_headers, with_transport_retries
+from zust_runner.config_paths import normalize_config_rel
 from zust_runner.metrics import run_training_with_metrics
 from zust_runner.outbound import RunOutbound
 from zust_runner.sync_coordinator import RunSyncCoordinator
@@ -476,12 +477,18 @@ def _clear_origin_credentials(checkout: Path, outbound: RunOutbound, owner: str,
     )
 
 
-def _maybe_clean_tensorboard(outbound: RunOutbound, checkout: Path) -> None:
+def _maybe_clean_tensorboard(
+    outbound: RunOutbound,
+    project_root: Path,
+    *,
+    repo_root: Path,
+) -> None:
     if os.environ.get("ZUST_CLEAN_TENSORBOARD") != "1":
         return
     from zust_runner.tensorboard_clean import clean_tensorboard_events
 
-    removed = clean_tensorboard_events(checkout, CONFIG_PATH)
+    config_rel = normalize_config_rel(CONFIG_PATH, _root_path())
+    removed = clean_tensorboard_events(project_root, config_rel, repo_root=repo_root)
     _emit_log(
         outbound,
         "stdout",
@@ -524,11 +531,13 @@ def run() -> int:
             global _coordinator
             from zust_runner.workspace_snapshot import workspace_snapshot_payload
 
+            config_rel = normalize_config_rel(CONFIG_PATH, _root_path())
             _coordinator = RunSyncCoordinator(
                 outbound,
                 cache_dir=cache_dir,
                 checkout=checkout,
-                config_rel=CONFIG_PATH,
+                repo_root=checkout,
+                config_rel=config_rel,
                 workspace_payload=workspace_snapshot_payload,
             )
             _coordinator.start()
@@ -574,7 +583,7 @@ def _execute(client: httpx.Client, outbound: RunOutbound, checkout: Path) -> int
 
     _clone_commit(checkout, outbound)
     workdir = _training_workdir(checkout)
-    _maybe_clean_tensorboard(outbound, workdir)
+    _maybe_clean_tensorboard(outbound, workdir, repo_root=checkout)
     if _coordinator is not None:
         _coordinator.sync_now(heartbeat=True, include_workspace=True)
 
@@ -613,10 +622,22 @@ def _execute(client: httpx.Client, outbound: RunOutbound, checkout: Path) -> int
         headers=_headers(),
         cache_path=cache_root / EFFECTIVE_ENV_FILE,
     )
-    _write_config_bytes(workdir, CONFIG_PATH, config_bytes)
+    config_rel = normalize_config_rel(CONFIG_PATH, _root_path())
+    _write_config_bytes(workdir, config_rel, config_bytes)
     _write_repo_dotenv(workdir, env_bytes)
     if _coordinator is not None:
-        _coordinator.bind_project_dir(workdir)
+        _coordinator.bind_project_dir(workdir, repo_root=checkout)
+        from zust_runner.metrics import resolve_training_log_dir
+
+        metrics_dir = resolve_training_log_dir(workdir, config_rel, repo_root=checkout)
+        if metrics_dir is not None:
+            _emit_log(outbound, "stdout", f"TensorBoard metrics: {metrics_dir}")
+        else:
+            _emit_log(
+                outbound,
+                "stdout",
+                "TensorBoard metrics disabled (config missing or train.log_dir empty)",
+            )
 
     interrupted = _handle_control(outbound, phase="training")
     if interrupted is not None:
@@ -628,7 +649,7 @@ def _execute(client: httpx.Client, outbound: RunOutbound, checkout: Path) -> int
         client,
         training_argv,
         workdir,
-        CONFIG_PATH,
+        config_rel,
         run_argv=lambda _client, argv, cwd: _run_argv(outbound, argv, cwd),
         coordinator=_coordinator,
     )

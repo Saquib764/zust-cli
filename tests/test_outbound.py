@@ -75,6 +75,40 @@ def test_progress_returns_purge_before_restart(tmp_path: Path) -> None:
     assert outbound.post_progress(phase="training") == 3
 
 
+def test_huggingface_push_does_not_stop_training(tmp_path: Path) -> None:
+    action = {
+        "type": "huggingface_push",
+        "folder_path": "outputs/checkpoint",
+        "repo_id": "user/model",
+        "requested_at": "2026-11-21T00:00:00+00:00",
+    }
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "cancel": False,
+                "runner_generation": 1,
+                "pending_action": action,
+                "logs_accepted": 0,
+                "metrics_accepted": 0,
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.test")
+    outbound = RunOutbound(
+        client,
+        api_base="https://api.test",
+        run_id="run_1",
+        headers={"Authorization": "Bearer t"},
+        cache_dir=tmp_path,
+        runner_generation=1,
+    )
+    assert outbound.post_progress(phase="training") == 0
+    assert outbound.peek_huggingface_action() == action
+
+
 def test_progress_does_not_raise_on_transport_error(tmp_path: Path) -> None:
     transport = httpx.MockTransport(lambda _request: httpx.Response(503))
     client = httpx.Client(transport=transport, base_url="https://api.test")

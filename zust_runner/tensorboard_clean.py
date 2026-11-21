@@ -7,9 +7,14 @@ from pathlib import Path
 from zust_runner.metrics import resolve_training_log_dir
 
 
-def clean_tensorboard_events(checkout: Path, config_rel: str) -> int:
+def clean_tensorboard_events(
+    project_root: Path,
+    config_rel: str,
+    *,
+    repo_root: Path | None = None,
+) -> int:
     """Delete events.out.tfevents.* under the training log_dir. Returns files removed."""
-    log_dir = resolve_training_log_dir(checkout, config_rel)
+    log_dir = resolve_training_log_dir(project_root, config_rel, repo_root=repo_root)
     if log_dir is None or not log_dir.is_dir():
         return 0
     removed = 0

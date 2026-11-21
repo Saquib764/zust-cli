@@ -24,11 +24,21 @@ _SKIP_DIR_NAMES = frozenset(
 
 
 def _skip_dir_name(name: str) -> bool:
-    return name in _SKIP_DIR_NAMES or name.endswith(".egg-info")
+    return name.startswith(".") or name in _SKIP_DIR_NAMES or name.endswith(".egg-info")
 
 
 def _skip_file_name(name: str) -> bool:
-    return name.endswith((".pyc", ".pyo"))
+    return name.startswith(".") or name.endswith((".pyc", ".pyo"))
+
+
+def _skip_relative_path(relative_path: str) -> bool:
+    parts = [part for part in relative_path.split("/") if part]
+    if not parts:
+        return False
+    for part in parts[:-1]:
+        if _skip_dir_name(part):
+            return True
+    return _skip_file_name(parts[-1]) if parts else False
 
 
 def repo_root() -> Path:
@@ -58,18 +68,18 @@ def scan_workspace_root() -> list[dict[str, Any]]:
             rel_dir = current.relative_to(root).as_posix()
         except ValueError:
             continue
-        if rel_dir and rel_dir != ".":
+        if rel_dir and rel_dir != "." and not _skip_relative_path(rel_dir):
             add_directory(rel_dir, current.stat().st_mtime)
 
         for name in filenames:
-            if name.startswith("."):
-                continue
             if _skip_file_name(name):
                 continue
             file_path = current / name
             try:
                 rel_file = file_path.relative_to(root).as_posix()
             except ValueError:
+                continue
+            if _skip_relative_path(rel_file):
                 continue
             try:
                 stat = file_path.stat()

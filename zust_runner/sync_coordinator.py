@@ -7,8 +7,10 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from zust_runner.huggingface_push import run_huggingface_push
 from zust_runner.metrics import collect_new_scalars, resolve_training_log_dir
 from zust_runner.metrics_cursor import apply_ack, load, save
+from zust_runner.runner_cache import action_fingerprint
 
 SYNC_INTERVAL_SECONDS = 10.0
 WORKSPACE_EVERY_N_SYNCS = 6
@@ -25,6 +27,7 @@ class RunSyncCoordinator:
         *,
         cache_dir: Path,
         checkout: Path | None = None,
+        repo_root: Path | None = None,
         config_rel: str = "",
         workspace_payload: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
@@ -33,11 +36,16 @@ class RunSyncCoordinator:
         self._cursor_path = cache_dir / "metrics-cursor.json"
         self._cursor = load(self._cursor_path)
         self._checkout = checkout
+        self._repo_root = repo_root if repo_root is not None else checkout
         self._config_rel = config_rel
         self._workspace_payload = workspace_payload
         self._log_dir: Path | None = None
         if checkout is not None and config_rel:
-            self._log_dir = resolve_training_log_dir(checkout, config_rel)
+            self._log_dir = resolve_training_log_dir(
+                checkout,
+                config_rel,
+                repo_root=self._repo_root,
+            )
 
         self._lock = threading.Lock()
         self._log_buffer: list[dict[str, str]] = []
@@ -46,13 +54,24 @@ class RunSyncCoordinator:
         self._sync_count = 0
         self._thread: threading.Thread | None = None
         self._metrics_thread: threading.Thread | None = None
+        self._hf_lock = threading.Lock()
+        self._hf_seen: set[tuple[str, str]] = set()
+        self._hf_thread: threading.Thread | None = None
 
-    def bind_project_dir(self, checkout: Path) -> None:
+    def bind_project_dir(self, project_root: Path, *, repo_root: Path | None = None) -> None:
         """Point metric collection at the training root after the config is written."""
         with self._lock:
-            self._checkout = checkout
+            self._checkout = project_root
+            if repo_root is not None:
+                self._repo_root = repo_root
             self._log_dir = (
-                resolve_training_log_dir(checkout, self._config_rel) if self._config_rel else None
+                resolve_training_log_dir(
+                    project_root,
+                    self._config_rel,
+                    repo_root=self._repo_root,
+                )
+                if self._config_rel
+                else None
             )
         self._ensure_metrics_thread()
 
@@ -73,6 +92,7 @@ class RunSyncCoordinator:
             self._metrics_thread.join(timeout=5)
         if self._thread is not None:
             self._thread.join(timeout=5)
+        self._join_huggingface_push()
         self.flush_metrics_barrier()
         self.sync_now(heartbeat=True, include_workspace=True)
 
@@ -88,7 +108,9 @@ class RunSyncCoordinator:
         include_workspace: bool = False,
     ) -> int:
         with self._lock:
-            return self._sync_locked(progress=progress, heartbeat=heartbeat, include_workspace=include_workspace)
+            control = self._sync_locked(progress=progress, heartbeat=heartbeat, include_workspace=include_workspace)
+        self._maybe_start_huggingface_push()
+        return control
 
     def flush_metrics_barrier(self) -> bool:
         """Drain TensorBoard scalars to the API before marking training complete."""
@@ -165,3 +187,57 @@ class RunSyncCoordinator:
         elif metrics:
             self._metrics_pending = metrics + self._metrics_pending
         return control
+
+    def _join_huggingface_push(self) -> None:
+        thread = self._hf_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5)
+
+    def _maybe_start_huggingface_push(self) -> None:
+        """Upload in the background so a running training process is left alone."""
+        if self._stop.is_set():
+            return
+        peek = getattr(self._outbound, "peek_huggingface_action", None)
+        if peek is None:
+            return
+        action = peek()
+        if not isinstance(action, dict) or action.get("type") != "huggingface_push":
+            return
+        fingerprint = (str(action.get("type") or ""), str(action.get("requested_at") or ""))
+        with self._hf_lock:
+            if fingerprint in self._hf_seen:
+                return
+            if self._hf_thread is not None and self._hf_thread.is_alive():
+                return
+            self._hf_seen.add(fingerprint)
+            self._hf_thread = threading.Thread(
+                target=self._huggingface_worker,
+                args=(dict(action),),
+                name="huggingface-push",
+                daemon=True,
+            )
+            self._hf_thread.start()
+
+    def _huggingface_worker(self, action: dict[str, Any]) -> None:
+        checkout = self._repo_root
+        try:
+            if checkout is None:
+                raise RuntimeError("training repo path is not ready")
+            run_huggingface_push(action, checkout, log=lambda line: self.buffer_log("stdout", line))
+        except Exception as exc:
+            self.buffer_log("stderr", f"Hugging Face upload failed: {exc}")
+        try:
+            self.sync_now(heartbeat=False)
+        except Exception:
+            pass
+        current = self._outbound.peek_huggingface_action()
+        if not isinstance(current, dict) or action_fingerprint(current) != action_fingerprint(action):
+            return
+        complete = getattr(self._outbound, "complete_runner_action", None)
+        if complete is None:
+            return
+        try:
+            complete(action)
+        except Exception as exc:
+            self.buffer_log("stderr", f"Hugging Face upload finished, but the queue was not cleared: {exc}")
+            self.sync_now(heartbeat=False)
