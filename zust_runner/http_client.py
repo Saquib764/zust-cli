@@ -11,7 +11,8 @@ import httpx
 _T = TypeVar("_T")
 
 _DEFAULT_TIMEOUT = httpx.Timeout(60.0, connect=45.0)
-_RETRIABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+# 404 is what a dead ngrok tunnel returns when the local API is off.
+_RETRIABLE_STATUS = frozenset({404, 408, 429, 500, 502, 503, 504})
 
 
 def is_retriable_api_error(exc: BaseException) -> bool:

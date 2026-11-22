@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from pathlib import Path
@@ -146,7 +147,10 @@ class RunSyncCoordinator:
     def _sync_loop(self) -> None:
         while not self._stop.wait(SYNC_INTERVAL_SECONDS):
             include_workspace = self._sync_count % WORKSPACE_EVERY_N_SYNCS == 0
-            self.sync_now(heartbeat=True, include_workspace=include_workspace)
+            try:
+                self.sync_now(heartbeat=True, include_workspace=include_workspace)
+            except Exception as exc:
+                print(f"Runner sync failed ({exc}); will retry", file=sys.stderr)
             self._sync_count += 1
 
     def _sync_locked(
@@ -180,7 +184,14 @@ class RunSyncCoordinator:
             except Exception:
                 pass
 
-        control, metrics_accepted = self._outbound.post_sync(payload)
+        try:
+            control, metrics_accepted = self._outbound.post_sync(payload)
+        except Exception:
+            if logs:
+                self._log_buffer = logs + self._log_buffer
+            if metrics:
+                self._metrics_pending = metrics + self._metrics_pending
+            raise
         if metrics_accepted == len(metrics) and metrics:
             apply_ack(self._cursor, metrics)
             save(self._cursor_path, self._cursor)

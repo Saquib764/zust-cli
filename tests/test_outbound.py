@@ -109,6 +109,41 @@ def test_huggingface_push_does_not_stop_training(tmp_path: Path) -> None:
     assert outbound.peek_huggingface_action() == action
 
 
+def test_queues_sync_on_404_then_flushes(tmp_path: Path) -> None:
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/sync"):
+            calls.append(1)
+            if len(calls) == 1:
+                return httpx.Response(404)
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "cancel": False,
+                    "runner_generation": 1,
+                    "logs_accepted": 1,
+                    "metrics_accepted": 0,
+                },
+            )
+        return httpx.Response(404)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.test")
+    outbound = RunOutbound(
+        client,
+        api_base="https://api.test",
+        run_id="run_1",
+        headers={"Authorization": "Bearer t"},
+        cache_dir=tmp_path,
+    )
+    assert outbound.post_progress(phase="training") == 0
+    assert outbound._queue_path.exists()
+    outbound.flush()
+    assert not outbound._queue_path.exists()
+    assert len(calls) == 2
+
+
 def test_progress_does_not_raise_on_transport_error(tmp_path: Path) -> None:
     transport = httpx.MockTransport(lambda _request: httpx.Response(503))
     client = httpx.Client(transport=transport, base_url="https://api.test")
