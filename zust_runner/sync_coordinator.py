@@ -21,6 +21,10 @@ _MAX_LOG_BATCH = 2000
 _MAX_METRIC_BATCH = 500
 
 
+def _metric_key(point: dict[str, Any]) -> tuple[Any, Any, Any]:
+    return (point.get("_event_file"), point.get("tag"), point.get("step"))
+
+
 class RunSyncCoordinator:
     def __init__(
         self,
@@ -108,10 +112,17 @@ class RunSyncCoordinator:
         heartbeat: bool = False,
         include_workspace: bool = False,
     ) -> int:
-        with self._lock:
-            control = self._sync_locked(progress=progress, heartbeat=heartbeat, include_workspace=include_workspace)
-        self._maybe_start_huggingface_push()
-        return control
+        try:
+            with self._lock:
+                return self._sync_locked(
+                    progress=progress,
+                    heartbeat=heartbeat,
+                    include_workspace=include_workspace,
+                )
+        finally:
+            # A cursor-save failure happens after the API response is stored. The upload
+            # still has to start, or a queued Hugging Face push sits forever during training.
+            self._maybe_start_huggingface_push()
 
     def flush_metrics_barrier(self) -> bool:
         """Drain TensorBoard scalars to the API before marking training complete."""
@@ -142,7 +153,35 @@ class RunSyncCoordinator:
         if not points:
             return
         with self._lock:
-            self._metrics_pending.extend(points)
+            self._enqueue_metrics(points)
+
+    def _enqueue_metrics(self, points: list[dict[str, Any]]) -> None:
+        """Queue each scalar once. A later read refreshes the queued value instead of stacking a copy."""
+        index = {_metric_key(point): i for i, point in enumerate(self._metrics_pending)}
+        for point in points:
+            if self._point_covered(point):
+                continue
+            key = _metric_key(point)
+            existing = index.get(key)
+            if existing is not None:
+                self._metrics_pending[existing] = point
+                continue
+            index[key] = len(self._metrics_pending)
+            self._metrics_pending.append(point)
+
+    def _point_covered(self, point: dict[str, Any]) -> bool:
+        file_key = point.get("_event_file")
+        tag = point.get("tag")
+        if not isinstance(file_key, str) or not isinstance(tag, str):
+            return False
+        try:
+            step = int(point.get("step"))
+        except (TypeError, ValueError):
+            return False
+        return step <= self._cursor.get(file_key, {}).get(tag, -1)
+
+    def _drop_pending_covered_by_cursor(self) -> None:
+        self._metrics_pending = [point for point in self._metrics_pending if not self._point_covered(point)]
 
     def _sync_loop(self) -> None:
         while not self._stop.wait(SYNC_INTERVAL_SECONDS):
@@ -194,7 +233,11 @@ class RunSyncCoordinator:
             raise
         if metrics_accepted == len(metrics) and metrics:
             apply_ack(self._cursor, metrics)
-            save(self._cursor_path, self._cursor)
+            self._drop_pending_covered_by_cursor()
+            try:
+                save(self._cursor_path, self._cursor)
+            except OSError as exc:
+                print(f"Could not save metrics cursor ({exc}); will retry", file=sys.stderr)
         elif metrics:
             self._metrics_pending = metrics + self._metrics_pending
         return control

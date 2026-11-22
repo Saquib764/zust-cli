@@ -87,6 +87,40 @@ def test_sync_starts_huggingface_push_without_stopping_training(tmp_path: Path, 
     assert calls == [action]
 
 
+def test_huggingface_push_starts_when_sync_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    action = {
+        "type": "huggingface_push",
+        "folder_path": "outputs/checkpoint",
+        "repo_id": "user/model",
+        "requested_at": "2026-11-21T00:00:00+00:00",
+    }
+    calls: list[dict] = []
+
+    def fake_push(pending: dict, checkout: Path, *, log) -> None:
+        del checkout
+        calls.append(pending)
+        log("uploading")
+
+    def explode(self, **kwargs) -> int:
+        del self, kwargs
+        raise RuntimeError("cursor save failed")
+
+    monkeypatch.setattr("zust_runner.sync_coordinator.run_huggingface_push", fake_push)
+    monkeypatch.setattr(RunSyncCoordinator, "_sync_locked", explode)
+    outbound = _Outbound(action)
+    checkout = tmp_path / "repo"
+    checkout.mkdir()
+    coordinator = RunSyncCoordinator(outbound, cache_dir=tmp_path / "cache", checkout=checkout)
+
+    with pytest.raises(RuntimeError, match="cursor save failed"):
+        coordinator.sync_now(heartbeat=True)
+
+    assert coordinator._hf_thread is not None
+    coordinator._hf_thread.join(timeout=5)
+    assert calls == [action]
+    assert outbound.completed == [action]
+
+
 def test_huggingface_push_failure_is_logged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     action = {
         "type": "huggingface_push",

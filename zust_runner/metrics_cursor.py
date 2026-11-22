@@ -30,7 +30,7 @@ def save(path: Path, cursor: dict[str, dict[str, int]]) -> None:
     with tempfile.NamedTemporaryFile("wb", delete=False, dir=path.parent) as handle:
         handle.write(data)
         temp_name = handle.name
-    path.replace(temp_name)
+    Path(temp_name).replace(path)
 
 
 def apply_ack(cursor: dict[str, dict[str, int]], points: list[dict[str, Any]]) -> None:

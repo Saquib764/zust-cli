@@ -8,7 +8,7 @@ import yaml
 
 from zust_runner.config_paths import find_config_file, normalize_config_rel
 from zust_runner.metrics import collect_new_scalars, resolve_training_log_dir
-from zust_runner.metrics_cursor import apply_ack
+from zust_runner.metrics_cursor import apply_ack, load, save
 
 
 def test_normalize_config_rel_strips_root_prefix() -> None:
@@ -58,6 +58,12 @@ def test_resolve_training_log_dir_disabled(tmp_path: Path) -> None:
 
 def _scalar_event(step: int, value: float) -> SimpleNamespace:
     return SimpleNamespace(step=step, value=value, wall_time=1_700_000_000.0)
+
+
+def test_save_creates_cursor_file(tmp_path: Path) -> None:
+    path = tmp_path / "metrics-cursor.json"
+    save(path, {"events.out.tfevents.test": {"train/loss": 4}})
+    assert load(path) == {"events.out.tfevents.test": {"train/loss": 4}}
 
 
 def test_collect_new_scalars_tracks_cursors_per_event_file(tmp_path: Path) -> None:
