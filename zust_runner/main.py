@@ -488,7 +488,17 @@ def _maybe_clean_tensorboard(
     from zust_runner.tensorboard_clean import clean_tensorboard_events
 
     config_rel = normalize_config_rel(CONFIG_PATH, _root_path())
-    removed = clean_tensorboard_events(project_root, config_rel, repo_root=repo_root)
+    acked = None
+    if _coordinator is not None:
+        _coordinator.bind_project_dir(project_root, repo_root=repo_root)
+        _coordinator.flush_metrics_barrier()
+        acked = _coordinator.cursor
+    removed = clean_tensorboard_events(
+        project_root,
+        config_rel,
+        repo_root=repo_root,
+        acked=acked,
+    )
     _emit_log(
         outbound,
         "stdout",
@@ -656,15 +666,30 @@ def _execute(client: httpx.Client, outbound: RunOutbound, checkout: Path) -> int
     if _stopped_for_control(training_code):
         return training_code
     if _coordinator is not None and not _coordinator.flush_metrics_barrier():
-        failed_stage = "metrics_flush"
-        outbound.post_progress(
-            execution_status="FAILED",
-            phase="finished",
-            failed_stage=failed_stage,
-            setup_exit_code=setup_code,
-            training_exit_code=training_code,
+        _emit_log(
+            outbound,
+            "stderr",
+            "TensorBoard metrics were still uploading when training finished.",
         )
-        return 1
+    if training_code == 130:
+        if outbound._last_run_cancelled:
+            outbound.post_progress(
+                execution_status="CANCELLED",
+                phase="finished",
+                failed_stage="cancelled",
+                setup_exit_code=setup_code,
+                training_exit_code=training_code,
+            )
+        else:
+            outbound.post_progress(
+                execution_status="FAILED",
+                phase="finished",
+                failed_stage="stopped",
+                setup_exit_code=setup_code,
+                training_exit_code=training_code,
+                cancel_requested=False,
+            )
+        return training_code
     if training_code != 0:
         failed_stage = "training"
         outbound.post_progress(

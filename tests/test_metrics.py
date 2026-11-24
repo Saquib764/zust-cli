@@ -1,14 +1,15 @@
 """TensorBoard log dir resolution and metric tail cursors for the runner."""
 
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import yaml
 
+from tensorboard.compat.proto.event_pb2 import Event
+
 from zust_runner.config_paths import find_config_file, normalize_config_rel
-from zust_runner.metrics import collect_new_scalars, resolve_training_log_dir
-from zust_runner.metrics_cursor import apply_ack, load, save
+from zust_runner.event_tail import crc32c, encode_record, read_records
+from zust_runner.metrics import read_new_scalars, resolve_training_log_dir
+from zust_runner.metrics_cursor import apply_file_ack, load, save
 
 
 def test_normalize_config_rel_strips_root_prefix() -> None:
@@ -56,82 +57,71 @@ def test_resolve_training_log_dir_disabled(tmp_path: Path) -> None:
     assert resolve_training_log_dir(checkout, "config.yaml") is None
 
 
-def _scalar_event(step: int, value: float) -> SimpleNamespace:
-    return SimpleNamespace(step=step, value=value, wall_time=1_700_000_000.0)
+def _event_bytes(step: int, value: float, tag: str = "train/loss") -> bytes:
+    event = Event(wall_time=1_700_000_000.0, step=step)
+    summary = event.summary.value.add()
+    summary.tag = tag
+    summary.simple_value = value
+    return encode_record(event.SerializeToString())
+
+
+def test_crc32c_known_vector() -> None:
+    assert crc32c(b"123456789") == 0xE3069283
+
+
+def test_read_records_stops_before_a_torn_tail(tmp_path: Path) -> None:
+    path = tmp_path / "events.out.tfevents.test"
+    payload = _event_bytes(1, 0.5)
+    path.write_bytes(payload + b"\x01\x02")
+    records, offset = read_records(path, 0)
+    assert len(records) == 1
+    assert offset == len(payload)
+    again, offset_again = read_records(path, offset)
+    assert again == []
+    assert offset_again == offset
 
 
 def test_save_creates_cursor_file(tmp_path: Path) -> None:
     path = tmp_path / "metrics-cursor.json"
-    save(path, {"events.out.tfevents.test": {"train/loss": 4}})
-    assert load(path) == {"events.out.tfevents.test": {"train/loss": 4}}
+    cursor = {"version": 2, "files": {"events.out.tfevents.test": {"offset": 4, "dev": 1, "ino": 2}}}
+    save(path, cursor)
+    assert load(path) == cursor
 
 
-def test_collect_new_scalars_tracks_cursors_per_event_file(tmp_path: Path) -> None:
+def test_load_discards_step_cursor(tmp_path: Path) -> None:
+    path = tmp_path / "metrics-cursor.json"
+    path.write_text('{"events.out.tfevents.test": {"train/loss": 4}}', encoding="utf-8")
+    assert load(path) == {"version": 2, "files": {}}
+
+
+def test_read_new_scalars_tails_and_rereads_a_replaced_file(tmp_path: Path) -> None:
     log_dir = tmp_path / "tb"
-    log_dir.mkdir()
-    old_file = log_dir / "events.out.tfevents.old"
-    new_file = log_dir / "events.out.tfevents.new"
-    old_file.write_text("stub", encoding="utf-8")
-    new_file.write_text("stub", encoding="utf-8")
-
-    def fake_accumulator(path: str) -> SimpleNamespace:
-        if path.endswith("old"):
-            return SimpleNamespace(
-                Reload=lambda: None,
-                Tags=lambda: {"scalars": ["train/loss"]},
-                Scalars=lambda tag: [_scalar_event(187, 0.5)],
-            )
-        return SimpleNamespace(
-            Reload=lambda: None,
-            Tags=lambda: {"scalars": ["train/loss"]},
-            Scalars=lambda tag: [_scalar_event(1, 0.1), _scalar_event(2, 0.2)],
-        )
-
-    cursor: dict[str, dict[str, int]] = {}
-    with patch("zust_runner.metrics.EventAccumulator", side_effect=fake_accumulator):
-        first = collect_new_scalars(log_dir, cursor)
-    assert sorted(p["step"] for p in first) == [1, 2, 187]
-    apply_ack(cursor, first)
-
-    old_file.unlink()
-    with patch("zust_runner.metrics.EventAccumulator", side_effect=fake_accumulator):
-        second = collect_new_scalars(log_dir, cursor)
+    nested = log_dir / "run"
+    nested.mkdir(parents=True)
+    event_file = nested / "events.out.tfevents.child"
+    event_file.write_bytes(_event_bytes(1, 0.1) + _event_bytes(2, 0.2))
+    state: dict[str, dict[str, int]] = {}
+    first, reset = read_new_scalars(log_dir, state, attempt=3)
+    assert reset == []
+    assert [point["step"] for point in first] == [1, 2]
+    assert first[0]["attempt"] == 3
+    assert first[0]["_file"] == "run/events.out.tfevents.child"
+    cursor = {"version": 2, "files": {}}
+    apply_file_ack(cursor, first)
+    second, _reset = read_new_scalars(log_dir, state, attempt=3)
     assert second == []
 
+    event_file.unlink()
+    event_file.write_bytes(_event_bytes(7, 0.7))
+    replaced, reset = read_new_scalars(log_dir, state, attempt=4)
+    assert reset == ["run/events.out.tfevents.child"]
+    assert [point["step"] for point in replaced] == [7]
 
-def test_collect_new_scalars_after_tensorboard_wipe_resends_low_steps(tmp_path: Path) -> None:
+
+def test_read_new_scalars_keeps_a_repeated_step(tmp_path: Path) -> None:
     log_dir = tmp_path / "tb"
     log_dir.mkdir()
-
-    def write_generation(name: str) -> None:
-        path = log_dir / name
-        path.write_text("stub", encoding="utf-8")
-
-    write_generation("events.out.tfevents.gen1")
-
-    def fake_accumulator(path: str) -> SimpleNamespace:
-        if path.endswith("gen1"):
-            return SimpleNamespace(
-                Reload=lambda: None,
-                Tags=lambda: {"scalars": ["train/loss"]},
-                Scalars=lambda tag: [_scalar_event(187, 0.5)],
-            )
-        return SimpleNamespace(
-            Reload=lambda: None,
-            Tags=lambda: {"scalars": ["train/loss"]},
-            Scalars=lambda tag: [_scalar_event(1, 0.1), _scalar_event(50, 0.2)],
-        )
-
-    cursor: dict[str, dict[str, int]] = {}
-    with patch("zust_runner.metrics.EventAccumulator", side_effect=fake_accumulator):
-        first = collect_new_scalars(log_dir, cursor)
-    apply_ack(cursor, first)
-
-    for path in log_dir.glob("events.out.tfevents.*"):
-        path.unlink()
-    write_generation("events.out.tfevents.gen2")
-
-    with patch("zust_runner.metrics.EventAccumulator", side_effect=fake_accumulator):
-        after_wipe = collect_new_scalars(log_dir, cursor)
-
-    assert [p["step"] for p in after_wipe] == [1, 50]
+    event_file = log_dir / "events.out.tfevents.test"
+    event_file.write_bytes(_event_bytes(4, 1.0) + _event_bytes(4, 0.25))
+    points, _reset = read_new_scalars(log_dir, {}, attempt=1)
+    assert [point["value"] for point in points] == [1.0, 0.25]

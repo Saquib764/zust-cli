@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from zust_runner.huggingface_push import run_huggingface_push
-from zust_runner.metrics import collect_new_scalars, resolve_training_log_dir
-from zust_runner.metrics_cursor import apply_ack, load, save
+from zust_runner.metrics import event_relpath, iter_event_files, read_new_scalars, resolve_training_log_dir
+from zust_runner.metrics_cursor import apply_file_ack, load, reset_files, save
 from zust_runner.runner_cache import action_fingerprint
 
 SYNC_INTERVAL_SECONDS = 10.0
@@ -19,10 +19,6 @@ METRICS_COLLECT_SECONDS = 3.0
 METRICS_FLUSH_TIMEOUT_SECONDS = 120.0
 _MAX_LOG_BATCH = 2000
 _MAX_METRIC_BATCH = 500
-
-
-def _metric_key(point: dict[str, Any]) -> tuple[Any, Any, Any]:
-    return (point.get("_event_file"), point.get("tag"), point.get("step"))
 
 
 class RunSyncCoordinator:
@@ -40,6 +36,11 @@ class RunSyncCoordinator:
         self._cache_dir = cache_dir
         self._cursor_path = cache_dir / "metrics-cursor.json"
         self._cursor = load(self._cursor_path)
+        self._read_state = {
+            key: dict(entry) for key, entry in self._cursor.get("files", {}).items()
+        }
+        self._read_lock = threading.Lock()
+        self._pause_reader = threading.Event()
         self._checkout = checkout
         self._repo_root = repo_root if repo_root is not None else checkout
         self._config_rel = config_rel
@@ -81,7 +82,9 @@ class RunSyncCoordinator:
         self._ensure_metrics_thread()
 
     def _ensure_metrics_thread(self) -> None:
-        if self._log_dir is None or self._metrics_thread is not None or self._stop.is_set():
+        if self._log_dir is None or self._stop.is_set() or self._pause_reader.is_set():
+            return
+        if self._metrics_thread is not None and self._metrics_thread.is_alive():
             return
         self._metrics_thread = threading.Thread(target=self._metrics_collect_loop, daemon=True)
         self._metrics_thread.start()
@@ -93,6 +96,7 @@ class RunSyncCoordinator:
 
     def stop(self) -> None:
         self._stop.set()
+        self._pause_reader.set()
         if self._metrics_thread is not None:
             self._metrics_thread.join(timeout=5)
         if self._thread is not None:
@@ -100,6 +104,11 @@ class RunSyncCoordinator:
         self._join_huggingface_push()
         self.flush_metrics_barrier()
         self.sync_now(heartbeat=True, include_workspace=True)
+
+    @property
+    def cursor(self) -> dict[str, Any]:
+        with self._lock:
+            return {"version": self._cursor.get("version"), "files": {k: dict(v) for k, v in self._cursor.get("files", {}).items()}}
 
     def buffer_log(self, stream: str, line: str) -> None:
         with self._lock:
@@ -114,74 +123,125 @@ class RunSyncCoordinator:
     ) -> int:
         try:
             with self._lock:
-                return self._sync_locked(
+                control = self._sync_locked(
                     progress=progress,
                     heartbeat=heartbeat,
                     include_workspace=include_workspace,
                 )
+            try:
+                self._drain_metric_batches(1)
+            except Exception as exc:
+                print(f"Runner metric upload failed ({exc}); will retry", file=sys.stderr)
+            return control
         finally:
             # A cursor-save failure happens after the API response is stored. The upload
             # still has to start, or a queued Hugging Face push sits forever during training.
             self._maybe_start_huggingface_push()
 
     def flush_metrics_barrier(self) -> bool:
-        """Drain TensorBoard scalars to the API before marking training complete."""
+        """Drain TensorBoard scalars. A cancel or restart does not abandon the queue."""
         if self._log_dir is None:
             return True
+        self._pause_reader.set()
+        thread = self._metrics_thread
+        if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+            thread.join(timeout=15)
         deadline = time.monotonic() + METRICS_FLUSH_TIMEOUT_SECONDS
-        while time.monotonic() < deadline:
-            self._collect_metrics_into_pending()
-            accepted = self.sync_now(heartbeat=False)
-            if accepted != 0:
-                return False
-            with self._lock:
-                pending = len(self._metrics_pending)
-            fresh = collect_new_scalars(self._log_dir, self._cursor)
-            if not pending and not fresh:
-                return True
-            time.sleep(2.0)
-        return False
+        caught_up = False
+        try:
+            while time.monotonic() < deadline:
+                self._collect_metrics_into_pending()
+                try:
+                    self._drain_metric_batches(50)
+                except Exception as exc:
+                    print(f"Runner metric upload failed ({exc}); will retry", file=sys.stderr)
+                    time.sleep(1.0)
+                    continue
+                with self._lock:
+                    pending = len(self._metrics_pending)
+                if pending == 0 and not self._log_has_unread():
+                    caught_up = True
+                    break
+                time.sleep(0.2)
+            return caught_up
+        finally:
+            if not self._stop.is_set():
+                self._pause_reader.clear()
+                self._ensure_metrics_thread()
 
     def _metrics_collect_loop(self) -> None:
-        while not self._stop.wait(METRICS_COLLECT_SECONDS):
-            self._collect_metrics_into_pending()
+        while not self._stop.is_set():
+            if self._pause_reader.is_set():
+                return
+            try:
+                self._collect_metrics_into_pending()
+                self._drain_metric_batches(4)
+            except Exception as exc:
+                print(f"Runner metric upload failed ({exc}); will retry", file=sys.stderr)
+            if self._pause_reader.wait(METRICS_COLLECT_SECONDS):
+                return
+
+    def _current_attempt(self) -> int:
+        remote = int(getattr(self._outbound, "metrics_generation", 0) or 0)
+        local = int(getattr(self._outbound, "runner_generation", 1) or 1)
+        return max(remote, local, 1)
 
     def _collect_metrics_into_pending(self) -> None:
         if self._log_dir is None:
             return
-        points = collect_new_scalars(self._log_dir, self._cursor)
-        if not points:
+        with self._read_lock:
+            points, reset = read_new_scalars(self._log_dir, self._read_state, self._current_attempt())
+        if not points and not reset:
             return
         with self._lock:
-            self._enqueue_metrics(points)
+            if reset:
+                reset_files(self._cursor, reset)
+            self._metrics_pending.extend(points)
 
-    def _enqueue_metrics(self, points: list[dict[str, Any]]) -> None:
-        """Queue each scalar once. A later read refreshes the queued value instead of stacking a copy."""
-        index = {_metric_key(point): i for i, point in enumerate(self._metrics_pending)}
-        for point in points:
-            if self._point_covered(point):
-                continue
-            key = _metric_key(point)
-            existing = index.get(key)
-            if existing is not None:
-                self._metrics_pending[existing] = point
-                continue
-            index[key] = len(self._metrics_pending)
-            self._metrics_pending.append(point)
+    def _drain_metric_batches(self, max_batches: int) -> None:
+        for _ in range(max_batches):
+            if not self._drain_one_metric_batch():
+                return
 
-    def _point_covered(self, point: dict[str, Any]) -> bool:
-        file_key = point.get("_event_file")
-        tag = point.get("tag")
-        if not isinstance(file_key, str) or not isinstance(tag, str):
+    def _drain_one_metric_batch(self) -> bool:
+        with self._lock:
+            if not self._metrics_pending:
+                return False
+            batch = self._metrics_pending[:_MAX_METRIC_BATCH]
+            del self._metrics_pending[: len(batch)]
+        scalars = [point for point in batch if not point.get("_advance")]
+        body = [{key: value for key, value in point.items() if not str(key).startswith("_")} for point in scalars]
+        if body:
+            try:
+                self._outbound.post_metrics(body)
+            except Exception:
+                with self._lock:
+                    self._metrics_pending = batch + self._metrics_pending
+                raise
+        with self._lock:
+            apply_file_ack(self._cursor, batch)
+            try:
+                save(self._cursor_path, self._cursor)
+            except OSError as exc:
+                print(f"Could not save metrics cursor ({exc}); will retry", file=sys.stderr)
+        return True
+
+    def _log_has_unread(self) -> bool:
+        if self._log_dir is None:
             return False
-        try:
-            step = int(point.get("step"))
-        except (TypeError, ValueError):
-            return False
-        return step <= self._cursor.get(file_key, {}).get(tag, -1)
-
-    def _drop_pending_covered_by_cursor(self) -> None:
-        self._metrics_pending = [point for point in self._metrics_pending if not self._point_covered(point)]
+        with self._read_lock:
+            state = {key: int(entry.get("offset") or 0) for key, entry in self._read_state.items()}
+        for path in iter_event_files(self._log_dir):
+            rel = event_relpath(self._log_dir, path)
+            if rel is None:
+                continue
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if size > state.get(rel, 0):
+                return True
+        return False
 
     def _sync_loop(self) -> None:
         while not self._stop.wait(SYNC_INTERVAL_SECONDS):
@@ -202,16 +262,9 @@ class RunSyncCoordinator:
         logs = self._log_buffer[:_MAX_LOG_BATCH]
         self._log_buffer = self._log_buffer[len(logs) :]
 
-        metrics: list[dict[str, Any]] = []
-        while self._metrics_pending and len(metrics) < _MAX_METRIC_BATCH:
-            metrics.append(self._metrics_pending.pop(0))
-
         payload: dict[str, Any] = {
             "heartbeat": heartbeat,
             "log_entries": logs,
-            "metric_points": [
-                {k: v for k, v in point.items() if k != "_event_file"} for point in metrics
-            ],
         }
         if progress:
             payload["progress"] = progress
@@ -224,22 +277,11 @@ class RunSyncCoordinator:
                 pass
 
         try:
-            control, metrics_accepted = self._outbound.post_sync(payload)
+            control, _metrics_accepted = self._outbound.post_sync(payload)
         except Exception:
             if logs:
                 self._log_buffer = logs + self._log_buffer
-            if metrics:
-                self._metrics_pending = metrics + self._metrics_pending
             raise
-        if metrics_accepted == len(metrics) and metrics:
-            apply_ack(self._cursor, metrics)
-            self._drop_pending_covered_by_cursor()
-            try:
-                save(self._cursor_path, self._cursor)
-            except OSError as exc:
-                print(f"Could not save metrics cursor ({exc}); will retry", file=sys.stderr)
-        elif metrics:
-            self._metrics_pending = metrics + self._metrics_pending
         return control
 
     def _join_huggingface_push(self) -> None:

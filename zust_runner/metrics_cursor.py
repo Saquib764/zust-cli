@@ -1,4 +1,4 @@
-"""Persist TensorBoard upload cursors; advance only after the API accepts a batch."""
+"""Persist TensorBoard file offsets. The offset moves only after the API accepts the bytes."""
 
 from __future__ import annotations
 
@@ -7,42 +7,77 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+CURSOR_VERSION = 2
 
-def load(path: Path) -> dict[str, dict[str, int]]:
+
+def empty() -> dict[str, Any]:
+    return {"version": CURSOR_VERSION, "files": {}}
+
+
+def load(path: Path) -> dict[str, Any]:
     if not path.is_file():
-        return {}
+        return empty()
     raw = path.read_text(encoding="utf-8").strip()
     if not raw:
-        return {}
-    parsed = json.loads(raw)
-    if not isinstance(parsed, dict):
-        return {}
-    out: dict[str, dict[str, int]] = {}
-    for file_key, tags in parsed.items():
-        if isinstance(file_key, str) and isinstance(tags, dict):
-            out[file_key] = {str(k): int(v) for k, v in tags.items() if isinstance(v, (int, float))}
-    return out
+        return empty()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return empty()
+    if not isinstance(parsed, dict) or parsed.get("version") != CURSOR_VERSION:
+        return empty()
+    files = parsed.get("files")
+    if not isinstance(files, dict):
+        return empty()
+    cleaned: dict[str, dict[str, int]] = {}
+    for key, entry in files.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        try:
+            cleaned[key] = {
+                "offset": int(entry.get("offset") or 0),
+                "dev": int(entry.get("dev") or 0),
+                "ino": int(entry.get("ino") or 0),
+            }
+        except (TypeError, ValueError):
+            continue
+    return {"version": CURSOR_VERSION, "files": cleaned}
 
 
-def save(path: Path, cursor: dict[str, dict[str, int]]) -> None:
+def save(path: Path, cursor: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = json.dumps(cursor, separators=(",", ":")).encode("utf-8")
+    payload = {"version": CURSOR_VERSION, "files": cursor.get("files") or {}}
+    data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     with tempfile.NamedTemporaryFile("wb", delete=False, dir=path.parent) as handle:
         handle.write(data)
         temp_name = handle.name
     Path(temp_name).replace(path)
 
 
-def apply_ack(cursor: dict[str, dict[str, int]], points: list[dict[str, Any]]) -> None:
-    for point in points:
-        file_key = point.get("_event_file")
-        tag = point.get("tag")
-        step = point.get("step")
-        if not isinstance(file_key, str) or not isinstance(tag, str):
+def apply_file_ack(cursor: dict[str, Any], items: list[dict[str, Any]]) -> None:
+    """Advance each file to the furthest acked record. Callers pass a queue prefix."""
+    files: dict[str, dict[str, int]] = cursor.setdefault("files", {})
+    for item in items:
+        rel = item.get("_file")
+        if not isinstance(rel, str):
             continue
         try:
-            step_int = int(step)
+            end = int(item.get("_offset"))
+            dev = int(item.get("_dev") or 0)
+            ino = int(item.get("_ino") or 0)
         except (TypeError, ValueError):
             continue
-        tag_state = cursor.setdefault(file_key, {})
-        tag_state[tag] = max(tag_state.get(tag, -1), step_int)
+        entry = files.setdefault(rel, {"offset": 0, "dev": dev, "ino": ino})
+        if int(entry.get("dev") or 0) != dev or int(entry.get("ino") or 0) != ino:
+            entry["offset"] = 0
+            entry["dev"] = dev
+            entry["ino"] = ino
+        entry["offset"] = max(int(entry.get("offset") or 0), end)
+
+
+def reset_files(cursor: dict[str, Any], relative_paths: list[str]) -> None:
+    files: dict[str, dict[str, int]] = cursor.setdefault("files", {})
+    for rel in relative_paths:
+        entry = files.get(rel)
+        if entry is not None:
+            entry["offset"] = 0

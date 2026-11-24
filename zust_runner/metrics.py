@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from zust_runner.config_paths import _path_within_any_anchor, find_config_file
+from zust_runner.event_tail import read_records, scalars_from_record
 
 _MAX_TAG_LEN = 200
 
@@ -44,50 +44,86 @@ def resolve_training_log_dir(
     return log_dir
 
 
-def _prune_event_file_state(cursor: dict[str, dict[str, int]], active_files: set[str]) -> None:
-    for stale in [name for name in cursor if name not in active_files]:
-        del cursor[stale]
+def event_relpath(log_dir: Path, path: Path) -> str | None:
+    try:
+        return path.resolve().relative_to(log_dir.resolve()).as_posix()
+    except ValueError:
+        return None
 
 
-def collect_new_scalars(log_dir: Path, cursor: dict[str, dict[str, int]]) -> list[dict[str, Any]]:
-    """Return scalar points newer than the persisted cursor (cursor is not mutated)."""
+def iter_event_files(log_dir: Path) -> list[Path]:
     if not log_dir.is_dir():
         return []
-    event_files = sorted(path for path in log_dir.glob("events.out.tfevents.*") if path.is_file())
-    active_names = {path.name for path in event_files}
-    _prune_event_file_state(cursor, active_names)
+    files = [
+        path
+        for path in log_dir.rglob("events.out.tfevents.*")
+        if path.is_file() and event_relpath(log_dir, path) is not None
+    ]
+    return sorted(files, key=lambda path: event_relpath(log_dir, path) or "")
 
-    out: list[dict[str, Any]] = []
-    for event_file in event_files:
-        file_key = event_file.name
-        tag_state = cursor.get(file_key, {})
-        try:
-            accumulator = EventAccumulator(str(event_file))
-            accumulator.Reload()
-        except Exception:
+
+def read_new_scalars(
+    log_dir: Path,
+    read_state: dict[str, dict[str, int]],
+    attempt: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Parse records past read_state. Returns queue items and files whose inode changed.
+
+    read_state is the in-memory tail, ahead of the acked cursor until a POST succeeds.
+    A torn record leaves the offset unchanged. Missing files stay in read_state.
+    """
+    if not log_dir.is_dir():
+        return [], []
+    items: list[dict[str, Any]] = []
+    reset: list[str] = []
+    for event_file in iter_event_files(log_dir):
+        rel = event_relpath(log_dir, event_file)
+        if rel is None:
             continue
-        for tag in accumulator.Tags().get("scalars", []):
-            if len(tag) > _MAX_TAG_LEN:
+        try:
+            stat = event_file.stat()
+        except OSError:
+            continue
+        entry = read_state.setdefault(rel, {"offset": 0, "dev": stat.st_dev, "ino": stat.st_ino})
+        if int(entry.get("dev") or 0) != stat.st_dev or int(entry.get("ino") or 0) != stat.st_ino:
+            entry["offset"] = 0
+            entry["dev"] = stat.st_dev
+            entry["ino"] = stat.st_ino
+            reset.append(rel)
+        offset = int(entry.get("offset") or 0)
+        if stat.st_size < offset:
+            entry["offset"] = 0
+            offset = 0
+            reset.append(rel)
+        if stat.st_size <= offset:
+            continue
+        try:
+            records, new_offset = read_records(event_file, offset)
+        except OSError:
+            continue
+        for payload, end in records:
+            scalars = scalars_from_record(payload)
+            scalars = [point for point in scalars if len(str(point["tag"])) <= _MAX_TAG_LEN]
+            if not scalars:
+                items.append(_marker(rel, end, stat.st_dev, stat.st_ino))
                 continue
-            last = tag_state.get(tag, -1)
-            for event in accumulator.Scalars(tag):
-                step = int(event.step)
-                if step <= last:
-                    continue
-                value = float(event.value)
-                if value != value or value in (float("inf"), float("-inf")):
-                    continue
-                point: dict[str, Any] = {
-                    "_event_file": file_key,
-                    "tag": tag,
-                    "step": step,
-                    "value": value,
-                }
-                if event.wall_time:
-                    point["wall_time"] = float(event.wall_time)
-                out.append(point)
-    out.sort(key=lambda item: (item["tag"], item["step"]))
-    return out
+            for point in scalars:
+                items.append(
+                    {
+                        **point,
+                        "attempt": attempt,
+                        "_file": rel,
+                        "_offset": end,
+                        "_dev": stat.st_dev,
+                        "_ino": stat.st_ino,
+                    }
+                )
+        entry["offset"] = new_offset
+    return items, reset
+
+
+def _marker(rel: str, end: int, dev: int, ino: int) -> dict[str, Any]:
+    return {"_advance": True, "_file": rel, "_offset": end, "_dev": dev, "_ino": ino}
 
 
 def run_training_with_metrics(

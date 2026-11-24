@@ -40,11 +40,24 @@ class RunOutbound:
         self._queue_path = self._cache_dir / "pending.jsonl"
         self._lock = threading.Lock()
         self._runner_generation = runner_generation
+        self._metrics_generation = runner_generation
         self._last_run_cancelled = False
         self._metrics_pending_path = self._cache_dir / "metrics-pending.jsonl"
         self._pending_control = 0
         self._hf_action_lock = threading.Lock()
         self._huggingface_action: dict[str, Any] | None = None
+
+    @property
+    def runner_generation(self) -> int:
+        return self._runner_generation
+
+    @property
+    def metrics_generation(self) -> int:
+        return self._metrics_generation
+
+    def note_metrics_generation(self, value: int) -> None:
+        if value > self._metrics_generation:
+            self._metrics_generation = value
 
     def note_control(self, code: int) -> None:
         if code:
@@ -124,12 +137,25 @@ class RunOutbound:
             return
         self.post_sync({"heartbeat": False, "workspace": payload})
 
-    def post_metrics(self, points: list[dict[str, Any]]) -> None:
+    def post_metrics(self, points: list[dict[str, Any]]) -> dict[str, Any]:
+        """POST scalars on their own request. Logs stay on /sync."""
         if not points:
-            return
-        _, accepted = self.post_sync({"heartbeat": False, "metric_points": points})
-        if accepted != len(points):
-            self._enqueue_metrics(points[accepted:])
+            return {"accepted": 0, "rejected": [], "metrics_generation": self._metrics_generation}
+
+        def _post() -> dict[str, Any]:
+            response = self._client.post(
+                f"{self._api_base}/api/v1/internal/runs/{self._run_id}/metrics",
+                headers=self._headers,
+                json={"points": points},
+                timeout=90.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+            if data.get("metrics_generation") is not None:
+                self.note_metrics_generation(int(data["metrics_generation"]))
+            return data
+
+        return with_transport_retries(_post)
 
     def _enqueue(self, record: dict[str, Any]) -> None:
         with self._lock:
@@ -167,6 +193,8 @@ class RunOutbound:
         return with_transport_retries(_post)
 
     def _control_from_response(self, data: dict[str, Any]) -> int:
+        if data.get("metrics_generation") is not None:
+            self.note_metrics_generation(int(data["metrics_generation"]))
         pending = data.get("pending_action")
         self._remember_huggingface_action(pending)
         if bool(data.get("cancel")):
