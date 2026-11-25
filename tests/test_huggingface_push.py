@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from zust_runner.huggingface_push import _token
+from zust_runner.huggingface_push import _token, run_huggingface_push
 from zust_runner.sync_coordinator import RunSyncCoordinator
 
 
@@ -28,6 +28,56 @@ def test_token_reads_repo_dotenv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     (checkout / ".env").write_text("HF_TOKEN=hf_from_dotenv\n", encoding="utf-8")
 
     assert _token(checkout) == "hf_from_dotenv"
+
+
+def test_replace_existing_deletes_remote_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    checkout = tmp_path / "repo"
+    folder = checkout / "outputs" / "ckpt"
+    folder.mkdir(parents=True)
+    (folder / "model.safetensors").write_bytes(b"weights")
+    monkeypatch.setenv("HF_TOKEN", "hf_test")
+    uploads: list[dict] = []
+
+    class _Api:
+        def __init__(self, token: str) -> None:
+            assert token == "hf_test"
+
+        def upload_folder(self, **kwargs) -> None:
+            uploads.append(kwargs)
+
+    monkeypatch.setattr("zust_runner.huggingface_push.HfApi", _Api)
+    run_huggingface_push(
+        {"folder_path": "outputs/ckpt", "repo_id": "user/model", "replace_existing": True},
+        checkout,
+    )
+
+    assert uploads[0]["repo_id"] == "user/model"
+    assert uploads[0]["delete_patterns"] == "*"
+    assert uploads[0]["folder_path"] == str(folder.resolve())
+
+
+def test_upload_keeps_existing_repo_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    checkout = tmp_path / "repo"
+    folder = checkout / "outputs" / "ckpt"
+    folder.mkdir(parents=True)
+    (folder / "model.safetensors").write_bytes(b"weights")
+    monkeypatch.setenv("HF_TOKEN", "hf_test")
+    uploads: list[dict] = []
+
+    class _Api:
+        def __init__(self, token: str) -> None:
+            del token
+
+        def upload_folder(self, **kwargs) -> None:
+            uploads.append(kwargs)
+
+    monkeypatch.setattr("zust_runner.huggingface_push.HfApi", _Api)
+    run_huggingface_push(
+        {"folder_path": "outputs/ckpt", "repo_id": "user/model"},
+        checkout,
+    )
+
+    assert "delete_patterns" not in uploads[0]
 
 
 def test_token_missing_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

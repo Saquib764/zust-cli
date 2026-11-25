@@ -103,12 +103,21 @@ def run_huggingface_push(
             exist_ok=True,
         )
 
-    emit(f"Uploading {folder_path} to huggingface.co/{repo_id} ...")
+    replace_existing = bool(action.get("replace_existing"))
+    if replace_existing:
+        emit(f"Replacing huggingface.co/{repo_id} with {folder_path} ...")
+    else:
+        emit(f"Uploading {folder_path} to huggingface.co/{repo_id} ...")
     api.upload_folder(
         repo_id=repo_id,
         folder_path=str(source),
         repo_type="model",
-        commit_message="Upload from Zust training run",
+        commit_message=(
+            "Replace repository contents from Zust training run"
+            if replace_existing
+            else "Upload from Zust training run"
+        ),
+        **({"delete_patterns": "*"} if replace_existing else {}),
     )
     emit(f"Uploaded {folder_path} to https://huggingface.co/{repo_id}")
 
