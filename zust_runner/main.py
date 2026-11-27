@@ -6,6 +6,7 @@ import codecs
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -353,6 +354,24 @@ def _image_torch_steps(argv: list[str], cwd: Path) -> tuple[list[list[str]], lis
     return prelude, _with_uv_skip_image_torch_packages(argv)
 
 
+def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Stop the command and every child it started. A plain terminate leaves workers behind."""
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            process.kill()
+        process.wait()
+
+
 def _run_argv(outbound: RunOutbound, argv: list[str], cwd: Path) -> int:
     if not argv:
         return 0
@@ -373,6 +392,7 @@ def _run_argv(outbound: RunOutbound, argv: list[str], cwd: Path) -> int:
         stderr=subprocess.PIPE,
         bufsize=0,
         shell=False,
+        start_new_session=True,
     )
     assert process.stdout is not None
     assert process.stderr is not None
@@ -389,18 +409,13 @@ def _run_argv(outbound: RunOutbound, argv: list[str], cwd: Path) -> int:
             time.sleep(0.5)
         exit_code = _control_exit(control)
         if exit_code is not None:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-            stdout_thread.join()
-            stderr_thread.join()
+            _stop_process_group(process)
+            stdout_thread.join(timeout=2)
+            stderr_thread.join(timeout=2)
             return exit_code
     code = process.returncode if process.returncode is not None else process.wait()
-    stdout_thread.join()
-    stderr_thread.join()
+    stdout_thread.join(timeout=2)
+    stderr_thread.join(timeout=2)
     return code
 
 
